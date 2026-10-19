@@ -4,3 +4,4 @@ category: session
 description:
   en: Trace selected conversation text to earlier messages and tool materials, save excerpts and decisions, and export a Markdown archive.
   zh: 按需追溯选中文本关联的历史消息和工具材料，保存摘录与决策，并导出 Markdown 档案。
+tarball: https://github.com/Milaro001/dsh-provenance-lens/releases/download/v0.1.0-beta.1/dsh-provenance-lens-0.1.0-beta.1.tgz

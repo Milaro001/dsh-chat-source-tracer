@@ -27,11 +27,9 @@ npm run check
 npm test
 npm pack --dry-run
 npm pack
-npm login
-npm publish --access public
 ```
 
-`npm publish` 不会自动让社区市场上架。也可以不发 npm，采用 GitHub 源码安装；推荐额外提供 GitHub Release 的预构建 `.tgz`。若源码不能直接安装，预构建 `.tgz` 则必须提供。用户要求的 ZIP 可作为交付附件，不能冒充目录 `tarball` 字段要求的 `.tgz`。上述命令用于发布阶段，不应把登录信息提交到 Git。
+将来如果另行选择 npm 分发，`npm publish` 不会自动让社区市场上架。也可以不发 npm，采用 GitHub 源码安装；推荐额外提供 GitHub Release 的预构建 `.tgz`。若源码不能直接安装，预构建 `.tgz` 则必须提供。用户要求的 ZIP 可作为交付附件，不能冒充目录 `tarball` 字段要求的 `.tgz`。上述命令用于发布阶段，不应把登录信息提交到 Git。
 
 ## 社区目录
 
@@ -41,15 +39,15 @@ npm publish --access public
 | --- | --- |
 | `dsh.bundle` 和其指向的 patch | 本地通过；patch 的包名与项目名一致 |
 | 可用源码与如实描述 | 有实际实现和测试；真实模型与超长会话仍有独立待验项，介绍不能写成无限上下文或真实生成过程追踪 |
-| 公开仓库与创建满 1 天 | 仓库已创建且公开；创建满 1 天的门槛以 GitHub 元数据为准，达到后再提交 |
-| `dsh-plugin` topic | 必须在线配置并核对，`package.json` 的 keywords 不能替代 topic |
+| 公开仓库与创建满 1 天 | 创建时间为 2026-10-19 19:38:22 UTC；北京时间 2026-10-21 03:38:22 后满 1 天，达到后再提交 |
+| `dsh-plugin` topic | 已在线配置并核对 `dsh-plugin`，包的 keywords 另行保留 |
 | 市场条目 | 已准备 `catalog/Milaro001__dsh-provenance-lens.yml`；`session` 分类、双语描述和路径命名已核对 |
 | 市场 PR 的实际路径 | 提交时放在市场仓库的 `data/plugins/Milaro001__dsh-provenance-lens.yml`；只新增本插件这一条，不手改生成 README 或其他条目 |
 | 截图 | `screenshots.json` 声明 1 张仓库内相对路径图片，文件存在，已同步当前 UI 的虚构会话预览 |
 | npm 与安装包映射 | npm 可选；若发布，`repository` 必须准确回指本仓库，不向条目添加 `npm:` 字段 |
 | Release 的 `tarball` | 使用固定 tag 的 GitHub Release HTTPS `.tgz` 链接；ZIP 不用于此字段，发市场 PR 前核验可下载 |
 | 依赖 | 当前无运行时 npm 依赖，未把官方 DSH 包放进 dependencies；将来新增官方包时按指南处理 peerDependencies 与预发布版本范围 |
-| 干净安装、同类条目对照 | 需分别验证干净包安装与同类条目，不用本机 `@local` 运行成功替代公开包端到端安装结果 |
+| 干净安装、同类条目对照 | 已在干净目录安装当前 `.tgz` 并验证 Host 导入及 5 条路由；DSH 原生公开包端到端安装与同类条目对照仍需核验 |
 | 目录 CI 与人工评审 | 尚未提交；本地测试和试算不等于目录 CI 通过，也不等于维护者批准 |
 
 单个 PR 最多 3 个条目，本插件只提交 1 条。若使用带版本的资产名，采用固定 release tag 的下载路径；若使用 `latest/download/`，资产名应保持不带版本，避免下次发版后链接失效。截图只维护在本仓库声明，不向目录旧的截图汇总文件添加条目。
