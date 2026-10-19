@@ -1,0 +1,6 @@
+url: https://github.com/Milaro001/dsh-provenance-lens
+name: Milaro001/dsh-provenance-lens
+category: session
+description:
+  en: Trace selected conversation text to earlier messages and tool materials, save excerpts and decisions, and export a Markdown archive.
+  zh: 按需追溯选中文本关联的历史消息和工具材料，保存摘录与决策，并导出 Markdown 档案。

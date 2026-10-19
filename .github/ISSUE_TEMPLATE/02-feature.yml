@@ -1,0 +1,24 @@
+name: 功能建议
+description: 说说你希望插件多做什么，或者哪里可以更顺手。
+title: "[建议] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题？
+      description: 描述实际使用场景，比只说一个功能名字更容易理解。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望它怎么做？
+      description: 可以写操作步骤、举个例子，或者附一张草图。
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: 你现在是怎么处理的？
+      description: 可选。已有的替代办法和不足，也能帮助判断优先级。
+

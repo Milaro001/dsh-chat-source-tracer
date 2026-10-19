@@ -1,0 +1,41 @@
+name: 报告问题
+description: 安装失败、分析报错、原文跳转或界面异常。
+title: "[问题] "
+body:
+  - type: markdown
+    attributes:
+      value: 谢谢你帮忙定位问题。尽量用虚构内容复现；截图和日志请先遮住私人对话、账号信息和密钥。
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      placeholder: 请填写实际使用的版本号
+    validations:
+      required: true
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本和操作系统
+      placeholder: 例如 DSH 版本、macOS / Windows / Linux 版本
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 出现了什么问题？
+      description: 说说你看到了什么，原本希望发生什么。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 怎样重现？
+      description: 从哪个按钮开始、选中了什么样的文本，按顺序写下来即可。
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息、报错或截图
+      description: 可补充对话大致长度、选区长度、模型名称，以及去掉私人内容的截图或日志。
+

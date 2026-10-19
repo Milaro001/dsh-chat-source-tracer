@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "title": "Provenance Lens",
+    "description": "Select a sentence in a long conversation to see which earlier questions, conclusions, and external sources support it; keep decisions, assumptions, and excerpts in an exportable archive."
+  },
+  "panel": {
+    "title": "Where this came from",
+    "hint": "Drag across a sentence in the chat · Esc to cancel",
+    "loading": "Reading back through the conversation…",
+    "empty": "Select a sentence first.",
+    "unsupported": "No supporting source found — the model may have added this itself.",
+    "close": "Close",
+    "retry": "Analyze again",
+    "evidenceCount": "{n} sources",
+    "turn": "turn {n}",
+    "roles": {
+      "user": "Your words",
+      "assistant": "My earlier conclusion",
+      "tool": "External material"
+    },
+    "relations": {
+      "direct": "Direct basis",
+      "inference": "Inference",
+      "merge": "Merged from several",
+      "assumption": "Model assumption",
+      "unsupported": "Unsupported"
+    },
+    "errorTitle": "Could not analyze",
+    "noRoute": "The Host endpoint is not reachable. Reinstall or restart the plugin.",
+    "claimMissing": "That sentence was not found in the session log; analyzed from the selection alone."
+  }
+}

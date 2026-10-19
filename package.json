@@ -1,0 +1,77 @@
+{
+  "name": "dsh-provenance-lens",
+  "version": "0.1.0-beta.1",
+  "description": "Trace selected DeepSeek Harness conversation text to earlier messages and tool materials, save excerpts and decisions, and export a Markdown archive.",
+  "type": "module",
+  "license": "MIT",
+  "author": "dsh-provenance-lens contributors",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "provenance",
+    "citation",
+    "long-context",
+    "decision-log",
+    "notes",
+    "溯源"
+  ],
+  "homepage": "https://github.com/Milaro001/dsh-provenance-lens#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Milaro001/dsh-provenance-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Milaro001/dsh-provenance-lens/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "retrieval.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "SUPPORT.md",
+    "PUBLISHING.md",
+    "LICENSE",
+    "docs/preview.jpg",
+    "docs/TESTING.md",
+    "screenshots.json"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "devDependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check retrieval.js",
+    "benchmark": "node scripts/benchmark.mjs",
+    "preview": "node tests/serve.mjs"
+  }
+}

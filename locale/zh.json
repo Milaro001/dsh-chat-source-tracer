@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "title": "溯源透镜",
+    "description": "在长对话里框选一句话，查看它由你之前的哪些提问、结论和外部材料支撑；把决策、假设和摘录沉淀成可导出的档案。"
+  },
+  "panel": {
+    "title": "这句话的依据",
+    "hint": "拖选聊天里的一句话 · Esc 取消",
+    "loading": "正在回看前面的对话…",
+    "empty": "先框选一句话。",
+    "unsupported": "未找到依据——这句可能是模型自行补充的。",
+    "close": "关闭",
+    "retry": "重新分析",
+    "evidenceCount": "{n} 条依据",
+    "turn": "第 {n} 轮",
+    "roles": {
+      "user": "你的原话",
+      "assistant": "我之前的结论",
+      "tool": "外部材料"
+    },
+    "relations": {
+      "direct": "直接依据",
+      "inference": "推论",
+      "merge": "合并多条",
+      "assumption": "模型假设",
+      "unsupported": "未找到依据"
+    },
+    "errorTitle": "分析失败",
+    "noRoute": "Host 端路由不可达，请重装或重启插件。",
+    "claimMissing": "这句话没能在会话日志里定位，仅按选区内容分析。"
+  }
+}

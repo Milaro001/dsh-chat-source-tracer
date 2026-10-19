@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Context Provenance Lens">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1f2937"/>
+  <circle cx="27" cy="27" r="12" fill="none" stroke="#7dd3fc" stroke-width="3.5"/>
+  <line x1="36" y1="36" x2="48" y2="48" stroke="#7dd3fc" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="27" cy="27" r="3.2" fill="#fbbf24"/>
+  <path d="M20 27h-4M34 27h4M27 20v-4M27 34v4" stroke="#fbbf24" stroke-width="2" stroke-linecap="round"/>
+</svg>

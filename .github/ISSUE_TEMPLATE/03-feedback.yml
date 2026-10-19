@@ -1,0 +1,17 @@
+name: 使用反馈
+description: 好用的地方、不顺手的地方，或者暂时还没有具体方案的想法。
+title: "[反馈] "
+body:
+  - type: textarea
+    id: feedback
+    attributes:
+      label: 想和我们说什么？
+      description: 不需要懂代码，直接描述你的使用感受就可以。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 使用场景或版本
+      description: 可选。告诉我们是在什么场景下使用，有助于理解你的感受。
+
