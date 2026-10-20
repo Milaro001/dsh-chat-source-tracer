@@ -24,12 +24,18 @@ window.__ModuleLoader__.load({
     const LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate'
     const EVIDENCE_LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate-evidence'
     const CORROBORATE_ROUTE = '/plugins/dsh-provenance-lens/corroborate'
+    const SEARCH_ROUTE = '/plugins/dsh-provenance-lens/search'
+    const RELATED_ROUTE = '/plugins/dsh-provenance-lens/related'
+    const RELATION_ROUTE = '/plugins/dsh-provenance-lens/relationships'
+    const pendingCrossJump = { value: null }
     const ARM_EVENT = 'dsh-provenance:arm'
     const JUMP_EVENT = 'dsh-provenance:jump-to-source'
     const CLAIM_HIGHLIGHT = 'dsp-claim'
     const SOURCE_HIGHLIGHT = 'dsp-source'
     const FOCUS_HIGHLIGHT = 'dsp-focus'
     const KEYWORD_HIGHLIGHT = 'dsp-keyword'
+    const SEARCH_HIGHLIGHT = 'dsp-search'
+    const SEARCH_CURRENT_HIGHLIGHT = 'dsp-search-current'
     const SIZE_KEY = 'dsh-provenance:size:v1'
     const FEEDBACK_KEY = 'dsh-provenance:feedback:v1'
     // Session-scoped detail behind the flat FEEDBACK_KEY set: enough to tell
@@ -89,7 +95,7 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------- ledger --- */
 
     function emptyLedger() {
-      return { decisions: [], assumptions: [], notes: [] }
+      return { decisions: [], assumptions: [], notes: [], trash: [] }
     }
 
     function loadLedger() {
@@ -100,6 +106,7 @@ window.__ModuleLoader__.load({
             decisions: raw.decisions,
             assumptions: raw.assumptions,
             notes: Array.isArray(raw.notes) ? raw.notes : [],
+            trash: Array.isArray(raw.trash) ? raw.trash.filter(validTrashEntry) : [],
           }
         }
       } catch {
@@ -111,8 +118,10 @@ window.__ModuleLoader__.load({
     function saveLedger(value) {
       try {
         localStorage.setItem(LEDGER_KEY, JSON.stringify(value))
+        return true
       } catch {
         // The in-memory archive still works when storage is denied.
+        return false
       }
     }
 
@@ -123,15 +132,21 @@ window.__ModuleLoader__.load({
       get() {
         return this.value
       },
-      update(mutator) {
-        const next = mutator({
+      update(mutator, { requirePersistence = false } = {}) {
+        const current = {
           decisions: [...this.value.decisions],
           assumptions: [...this.value.assumptions],
           notes: [...this.value.notes],
-        })
+          trash: [...this.value.trash],
+        }
+        // Older save paths return only the three active collections.
+        const next = { ...current, ...mutator(current) }
+        const persisted = saveLedger(next)
+        // Never remove an item if its recoverable copy cannot be saved.
+        if (requirePersistence && !persisted) return false
         this.value = next
-        saveLedger(next)
         for (const listener of this.listeners) listener()
+        return persisted
       },
       subscribe(listener) {
         this.listeners.add(listener)
@@ -147,6 +162,68 @@ window.__ModuleLoader__.load({
 
     function makeId(prefix) {
       return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    }
+
+    function validTrashEntry(entry) {
+      return entry && ['notes', 'decisions', 'assumptions'].includes(entry.kind)
+        && typeof entry.id === 'string' && entry.item && typeof entry.item.id === 'string'
+    }
+
+    /** Move the complete record atomically; linked assumptions stay independent. */
+    function recycleLedgerItem(kind, id) {
+      if (!['notes', 'decisions', 'assumptions'].includes(kind)) return 'missing'
+      const item = ledgerStore.get()[kind].find(record => record.id === id)
+      if (!item) return 'missing'
+      const persisted = ledgerStore.update(current => ({
+        ...current,
+        [kind]: current[kind].filter(record => record.id !== id),
+        trash: [{ id: makeId('trash'), kind, item, deletedAt: Date.now() }, ...current.trash],
+      }), { requirePersistence: true })
+      return persisted ? 'moved' : 'storage-error'
+    }
+
+    function restoreLedgerItem(id) {
+      const entry = ledgerStore.get().trash.find(record => record.id === id)
+      if (!entry) return 'missing'
+      // Keep both versions if an active record already owns this identity.
+      if (ledgerStore.get()[entry.kind].some(item => item.id === entry.item.id)) return 'duplicate'
+      const persisted = ledgerStore.update(current => ({
+        ...current,
+        [entry.kind]: [entry.item, ...current[entry.kind]]
+          .sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0)),
+        trash: current.trash.filter(record => record.id !== id),
+      }), { requirePersistence: true })
+      return persisted ? 'restored' : 'storage-error'
+    }
+
+    function recycleNotice(status, t) {
+      if (status === 'moved') return t('已移入回收站，可随时恢复。', 'Moved to the recycle bin. You can restore it anytime.')
+      if (status === 'restored') return t('已恢复到原来的分类。', 'Restored to its original category.')
+      if (status === 'duplicate') return t('原列表已有同编号内容，这条记录仍保留在回收站。', 'An active record has the same ID. This copy remains in the recycle bin.')
+      if (status === 'storage-error') return t('本机保存失败，内容未移动。请先导出备份，再重试。', 'Local save failed; nothing was moved. Export a backup before retrying.')
+      return t('这条内容已处理，请查看最新列表。', 'This item has already been handled. Check the updated list.')
+    }
+
+    function RecycleBin({ entries, en, archive = false, onRestore }) {
+      const t = (zh, english) => en ? english : zh
+      const prefix = archive ? 'dpl' : 'dsp'
+      const kindLabel = kind => kind === 'notes' ? t('摘录', 'Note')
+        : kind === 'decisions' ? t('结论', 'Conclusion') : t('假设', 'Assumption')
+      return h('div', { className: 'dpr-list', role: 'region', 'aria-label': t('回收站内容', 'Recycle bin contents') },
+        h('div', { className: `${prefix}-note dpr-hint` },
+          t('删除的内容保留在这里，恢复后回到原来的分类。', 'Deleted items stay here. Restore them to their original category.')),
+        entries.length ? entries.map(entry => h('div', {
+          key: entry.id, className: archive ? 'dpl-card' : 'dsp-note-item', 'data-trash-id': entry.id,
+        },
+          h('div', { className: 'dpr-kind' }, kindLabel(entry.kind)),
+          h('div', { className: archive ? 'dpl-note' : 'dsp-note-text' }, entry.item.text || entry.item.claim),
+          h('div', { className: archive ? 'dpl-meta' : 'dsp-note-meta' },
+            h(CompactMeta, { time: entry.deletedAt, en, prefix: t('删除于 ', 'Deleted ') })),
+          h('div', { className: archive ? 'dpl-actions' : 'dsp-note-actions' },
+            h('button', { type: 'button', className: `${prefix}-btn`, onClick: () => onRestore(entry.id),
+              title: t('恢复到', 'Restore to ') + kindLabel(entry.kind) }, t('恢复', 'Restore'))),
+        )) : h('div', { className: archive ? 'dpl-empty' : 'dsp-note' }, t('回收站是空的。', 'The recycle bin is empty.')),
+      )
     }
 
     /** Hand a focus identity to the Archive view and activate its tab. */
@@ -210,7 +287,7 @@ window.__ModuleLoader__.load({
       for (const root of roots) {
         if (!root) continue
         for (const element of root.querySelectorAll('button, [role="tab"], a')) {
-          if (element.closest('.dsp-card, .dsp-pill, .dsp-hint')) continue
+          if (element.closest('.dsp-card, .dsp-pill, .dsp-hint, .dsp-source-actions, .dsp-reading-return')) continue
           const text = (element.textContent || '').trim()
           if (labels.includes(text)) {
             element.click()
@@ -791,11 +868,106 @@ window.__ModuleLoader__.load({
       )
     }
 
+    const DANGER_STYLES = `
+      .dsp-card, .dpl-root, .dsp-pill {
+        --dsp-danger-text: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d84f62) 60%, var(--dsw-alias-label-primary, #1a2b46));
+        --dsp-danger-bg: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d84f62) 16%, transparent);
+        --dsp-danger-border: color-mix(in srgb, var(--dsp-danger-text) 58%, var(--dsw-alias-border-l2, #d4dfed));
+        --dsp-danger-ring: color-mix(in srgb, var(--dsp-danger-text) 12%, transparent);
+      }
+      :is(.dsp-card, .dpl-root, .dsp-pill) :is(.dsp-btn.danger, .dpl-btn.danger, .dsp-close, .dsp-pill-x) {
+        transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+      }
+      :is(.dsp-card, .dpl-root, .dsp-pill) :is(.dsp-btn.danger, .dpl-btn.danger, .dsp-close, .dsp-pill-x):not(:disabled):is(:hover, :focus-visible) {
+        background: var(--dsp-danger-bg); color: var(--dsp-danger-text);
+        border-color: var(--dsp-danger-border); box-shadow: 0 0 0 1px var(--dsp-danger-ring);
+      }
+      :is(.dsp-card, .dpl-root, .dsp-pill) :is(.dsp-btn.danger, .dpl-btn.danger, .dsp-close, .dsp-pill-x):focus-visible {
+        outline: 2px solid var(--dsp-danger-text); outline-offset: 3px;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        :is(.dsp-card, .dpl-root, .dsp-pill) :is(.dsp-btn.danger, .dpl-btn.danger, .dsp-close, .dsp-pill-x) { transition: none; }
+      }
+    `
+
+    const RECYCLE_STYLES = `
+      .dpr-list { display: flex; flex-direction: column; gap: 10px; max-width: 860px; }
+      .dpr-hint { color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * .92); font-weight: 400; }
+      .dpr-kind { display: inline-block; align-self: flex-start; width: fit-content; border: 1px solid var(--dsw-alias-border-l2); border-radius: 5px; padding: 0 6px; margin-bottom: 6px; color: var(--dsp-accent, var(--dsw-alias-brand-primary)); font-size: calc(var(--dsp-fs, 13px) * .85); }
+      .dsp-trash-toggle[aria-pressed="true"] { color: var(--dsp-accent, var(--dsw-alias-brand-primary)); background: var(--dsp-accent-soft); }
+      .dpl-notice { margin-bottom: 12px; color: var(--dsp-accent, var(--dsw-alias-brand-primary)); }
+    `
+
+    const RELATED_STYLES = `
+      .dsp-scope { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; margin-right: 4px; padding: 3px 7px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; cursor: pointer; }
+      .dsp-scope:not(:disabled):is(:hover,:focus-visible), .dsp-scope[aria-pressed="true"] { border-color: var(--dsp-hover-border); color: var(--dsp-accent, #4f8cff); background: var(--dsp-accent-soft); }
+      .dsp-scope:disabled { cursor: default; opacity: .65; }
+      .dsp-related-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--dsw-alias-label-secondary); opacity: .5; }
+      .dsp-related-dot.found { background: #36b882; opacity: 1; box-shadow: 0 0 5px #36b88255; }
+      .dsp-related-dot.searching { background: var(--dsp-accent, #4f8cff); animation: dsp-related-pulse 1.2s ease-in-out infinite; }
+      @keyframes dsp-related-pulse { 50% { opacity: 1; } }
+      .dsp-related-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: calc(var(--dsp-fs,13px) * .85); color: var(--dsw-alias-label-secondary); }
+      .dsp-related-title { color: var(--dsp-accent, #4f8cff); font-weight: 600; overflow-wrap: anywhere; }
+      .dsp-related-relation { font-size: calc(var(--dsp-fs,13px) * .85); color: var(--dsp-accent, #4f8cff); }
+      .dsp-related-explanation { border-top: 1px solid var(--dsw-alias-border-l1); padding-top: 6px; font-size: calc(var(--dsp-fs,13px) * .92); overflow-wrap: anywhere; }
+      .dsp-related-explanation.contradicts { color: var(--dsw-alias-state-warn-primary); }
+      .dsp-related-tools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+      @media(prefers-reduced-motion:reduce) { .dsp-related-dot.searching { animation: none; } }
+    `
+
+    const READING_STYLES = `
+      .dsp-quote-wrap { min-width: 0; }
+      .dsp-ev-quote { line-height: 1.65; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
+      .dsp-ev-quote.clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+      .dsp-ev-quote.expanded { white-space: pre-wrap; }
+      .dsp-quote-toggle { display: block; margin-top: 5px; padding: 1px 0; border: 0; background: transparent; color: var(--dsp-accent, #4f8cff); font: inherit; font-size: .85em; cursor: pointer; border-radius: 3px; }
+      .dsp-quote-toggle:is(:hover,:focus-visible) { text-decoration: underline; text-underline-offset: 3px; }
+      .dsp-ev .dsp-ev-head { margin-bottom: 7px; gap: 8px; }
+      .dsp-ev .dsp-ev-why { border-top: 1px solid var(--dsw-alias-border-l1); margin-top: 9px; padding-top: 7px; line-height: 1.55; font-size: .88em; }
+      .dsp-why-label { display: block; font-size: .9em; font-weight: 600; margin-bottom: 3px; }
+      .dsp-reading-notice { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .dsp-reading-notice .dsp-btn { font-size: inherit; flex-shrink: 0; }
+      .dsp-source-actions, .dsp-reading-return { position: fixed; z-index: 74; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); box-shadow: 0 5px 20px #0003; font-size: var(--dsp-fs,13px); border-radius: 10px; }
+      .dsp-source-actions { display: flex; flex-wrap: wrap; gap: 3px; padding: 4px; max-width: calc(100vw - 16px); animation: dsp-source-in 150ms ease-out; }
+      .dsp-source-actions button { white-space: nowrap; font: inherit; border: 0; border-radius: 6px; padding: 6px 8px; background: transparent; color: var(--dsw-alias-label-primary); cursor: pointer; transition: color 150ms, background 150ms; }
+      .dsp-source-actions .dsp-source-insert { color: var(--dsp-accent, #4f8cff); }
+      .dsp-source-actions button:is(:hover,:focus-visible), .dsp-reading-return:is(:hover,:focus-visible) { background: var(--dsp-accent-soft); color: var(--dsp-accent, #4f8cff); outline: 1px solid var(--dsp-accent, #4f8cff); }
+      .dsp-insert-error { flex-basis: 100%; max-width: 290px; padding: 4px 8px; font-size: .9em; color: var(--dsw-alias-label-secondary); }
+      .dsp-reading-return { right: 20px; bottom: 144px; padding: 8px 12px; cursor: pointer; font-family: inherit; }
+      .dsp-source-actions button:disabled, .dsp-reading-return:disabled { opacity: .55; cursor: default; }
+      @keyframes dsp-source-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+      @media(prefers-reduced-motion:reduce) { .dsp-source-actions { animation: none; } .dsp-source-actions button { transition: none; } }
+    `
+
     const STYLES = `
       ::highlight(dsp-claim) { background-color: rgba(245, 197, 66, 0.42); color: inherit; }
       ::highlight(dsp-source) { background-color: rgba(74, 158, 255, 0.26); color: inherit; text-decoration: underline; text-decoration-thickness: 1px; }
       ::highlight(dsp-focus) { background-color: rgba(74, 158, 255, 0.55); color: inherit; }
       ::highlight(dsp-keyword) { background-color: #ffd84d; color: #1b1400; text-decoration: underline; text-decoration-color: #ff9f1a; text-decoration-thickness: 2px; }
+      ::highlight(dsp-search) { background-color: rgba(255, 205, 72, .35); color: inherit; }
+      ::highlight(dsp-search-current) { background-color: rgba(255, 195, 45, .65); color: inherit; text-decoration: underline; }
+      .dsp-search-dock { position: relative; flex-shrink: 0; min-height: 50px; border-top: 1px solid var(--dsw-alias-border-l1); padding: 9px 16px; }
+      .dsp-search-peek { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; min-height: 31px; border: 0; padding: 0; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; cursor: text; transition: opacity 180ms ease; }
+      .dsp-search-peek small { display: flex; align-items: center; gap: 6px; opacity: .72; font-size: .85em; }
+      .dsp-search-form { position: absolute; inset: 9px 16px; display: flex; gap: 7px; align-items: center; opacity: 0; transform: translateY(10px); pointer-events: none; transition: opacity 240ms ease-in-out, transform 260ms cubic-bezier(.4,0,.2,1); }
+      .dsp-search-dock:is(:hover, :focus-within, .open) .dsp-search-form { opacity: 1; transform: translateY(0); pointer-events: auto; }
+      .dsp-search-dock:is(:hover, :focus-within, .open) .dsp-search-peek { opacity: 0; pointer-events: none; }
+      .dsp-search-input-wrap { display: flex; flex: 1; min-width: 0; align-items: center; gap: 7px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 9px; padding: 4px 9px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-base); transition: border-color 160ms, box-shadow 160ms; }
+      .dsp-search-input-wrap:focus-within { border-color: var(--dsp-accent, #4f8cff); box-shadow: 0 0 0 2px var(--dsp-hover-ring); }
+      .dsp-search-input { flex: 1; width: 100%; min-width: 0; border: 0; padding: 0; outline: 0; font: inherit; font-size: .92em; line-height: 1.65; background: transparent; color: var(--dsw-alias-label-primary); }
+      .dsp-search-input::-webkit-search-cancel-button { display: none; }
+      .dsp-search-clear { border: 0; background: transparent; color: inherit; font: inherit; padding: 0 3px; cursor: pointer; }
+      .dsp-search-count { font-size: .8em; white-space: nowrap; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+      .dsp-search-result { display: flex; flex-direction: column; gap: 7px; padding: 10px 11px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-base); }
+      .dsp-search-result.selected { border-color: var(--dsp-accent, #4f8cff); }
+      .dsp-search-result:hover { border-color: var(--dsp-hover-border); }
+      .dsp-search-hit { text-align: left; border: 0; background: transparent; padding: 0; color: inherit; font: inherit; cursor: pointer; overflow-wrap: anywhere; white-space: pre-wrap; }
+      .dsp-search-hit:hover { color: var(--dsp-hover-text); }
+      .dsp-search-hit small { display: block; color: var(--dsw-alias-label-secondary); font-size: .82em; margin-bottom: 4px; }
+      .dsp-search-results { display: flex; flex-direction: column; gap: 9px; }
+      .dsp-search-pager { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+      .dsp-search-mark { background: color-mix(in srgb, var(--dsp-accent, #4f8cff) 22%, transparent); color: inherit; border-radius: 2px; }
+      @media (hover: none) { .dsp-search-dock .dsp-search-form { opacity: 1; transform: none; pointer-events: auto; } .dsp-search-peek { visibility: hidden; } }
       .dsp-trigger {
         position: relative; overflow: visible; isolation: isolate;
         display: inline-flex; align-items: center; justify-content: center; gap: 4px;
@@ -959,7 +1131,7 @@ window.__ModuleLoader__.load({
       .dsp-x { width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; border: 0; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: calc(var(--dsp-fs, 13px) * 1.23); line-height: 1; padding: 0; border-radius: 6px; }
       .dsp-x svg { display: block; }
       .dsp-x:hover { background: var(--dsp-accent-soft, var(--dsw-alias-bg-layer-2)); color: var(--dsp-accent, var(--dsw-alias-label-primary)); }
-      .dsp-body { padding: 12px 12px 26px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; }
+      .dsp-body { padding: 12px 12px 18px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; }
       .dsp-head, .dsp-foot { flex: 0 0 auto; }
       .dsp-claim { border-left: 3px solid var(--dsp-accent, var(--dsw-alias-brand-primary)); padding: 2px 0 2px 10px; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
       .dsp-claim-actions { display: flex; gap: 6px; margin-top: -6px; }
@@ -1022,10 +1194,13 @@ window.__ModuleLoader__.load({
       .dsp-chip:is(:hover, :focus-visible) { border-color: var(--dsp-hover-border); color: var(--dsp-hover-text); background: var(--dsp-accent-soft, transparent); box-shadow: 0 0 0 1px var(--dsp-hover-ring); }
       .dsp-chip.active { color: var(--dsp-accent, var(--dsw-alias-brand-primary)); border-color: var(--dsp-accent, var(--dsw-alias-brand-primary)); background: var(--dsp-accent-soft, transparent); }
       .dsp-foot { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; padding: 10px 14px; border-top: 1px solid var(--dsw-alias-border-l1); color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.85); }
-      .dsp-foot-result { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; }
+      .dsp-foot-result { flex-direction: column; align-items: stretch; gap: 8px; padding: 8px 12px; }
       .dsp-foot-top { display: flex; align-items: center; gap: 8px; width: 100%; }
       .dsp-foot-aux { display: flex; flex-wrap: wrap; gap: 4px; }
-      .dsp-foot-stats { flex: 1; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+      .dsp-foot-aux:empty { display: none; }
+      .dsp-foot-top .dsp-search-dock { flex: 1; min-width: 0; min-height: 32px; padding: 0; border-top: 0; font-size: var(--dsp-fs, 13px); }
+      .dsp-foot-top .dsp-search-form { inset: 0; }
+      .dsp-foot-top .dsp-search-peek { min-height: 32px; }
       .dsp-foot-grid { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 6px; width: 100%; }
       .dsp-foot-cell { width: 100%; min-width: 0; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0 8px; font-size: 12px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .dsp-foot-aux .dsp-btn { font-size: 11px; padding: 2px 6px; }
@@ -1149,6 +1324,10 @@ window.__ModuleLoader__.load({
       @media (prefers-reduced-motion: reduce) {
         .dsp-frame, .dsp-hint, .dsp-hint::before, .dsp-hint::after, .dsp-trigger::before, .dsp-trigger::after { animation: none; }
       }
+      ${RELATED_STYLES}
+      ${READING_STYLES}
+      ${RECYCLE_STYLES}
+      ${DANGER_STYLES}
     `
 
     const LEDGER_STYLES = `
@@ -1164,7 +1343,7 @@ window.__ModuleLoader__.load({
       .dpl-stats { display: flex; gap: 18px; margin-bottom: 16px; color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.92); flex-wrap: wrap; }
       .dpl-stats b { color: var(--dsp-accent, var(--dsw-alias-label-primary)); font-size: calc(var(--dsp-fs, 13px) * 1.15); margin-right: 4px; }
       .dpl-section { display: flex; flex-direction: column; gap: 10px; max-width: 860px; }
-      .dpl-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+      .dpl-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
       .dpl-card { border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); border-radius: 12px; padding: 12px 14px; }
       .dpl-card:hover { border-color: var(--dsp-accent-soft, var(--dsw-alias-border-l2)); }
       .dpl-card.revoked { opacity: .55; }
@@ -1187,6 +1366,9 @@ window.__ModuleLoader__.load({
       .dpl-asm-row { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); border-radius: 10px; padding: 10px 12px; }
       .dpl-asm-text { flex: 1; }
       .dpl-asm-src { color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.85); margin-top: 4px; }
+      ${READING_STYLES}
+      ${RECYCLE_STYLES}
+      ${DANGER_STYLES}
     `
 
     function supportsHighlight() {
@@ -1195,7 +1377,7 @@ window.__ModuleLoader__.load({
 
     function clearHighlights() {
       if (!supportsHighlight()) return
-      for (const name of [CLAIM_HIGHLIGHT, SOURCE_HIGHLIGHT, FOCUS_HIGHLIGHT, KEYWORD_HIGHLIGHT]) {
+      for (const name of [CLAIM_HIGHLIGHT, SOURCE_HIGHLIGHT, FOCUS_HIGHLIGHT, KEYWORD_HIGHLIGHT, SEARCH_HIGHLIGHT, SEARCH_CURRENT_HIGHLIGHT]) {
         CSS.highlights.delete(name)
       }
     }
@@ -1210,7 +1392,7 @@ window.__ModuleLoader__.load({
       let best = null
       let bestLength = 0
       for (const element of document.querySelectorAll('div')) {
-        if (element.closest('.dsp-card, .dsp-pill, .dsp-hint')) continue
+        if (element.closest('.dsp-card, .dsp-pill, .dsp-hint, .dsp-source-actions, .dsp-reading-return')) continue
         if (!element.scrollHeight || element.scrollHeight <= element.clientHeight) continue
         const style = window.getComputedStyle(element)
         if (!/(auto|scroll)/.test(style.overflowY)) continue
@@ -1234,7 +1416,7 @@ window.__ModuleLoader__.load({
       let best = null
       let bestLength = 0
       for (const element of document.querySelectorAll('div')) {
-        if (element.closest('.dsp-card, .dsp-pill, .dsp-hint')) continue
+        if (element.closest('.dsp-card, .dsp-pill, .dsp-hint, .dsp-source-actions, .dsp-reading-return')) continue
         if (!element.scrollHeight || element.scrollHeight <= element.clientHeight) continue
         const style = window.getComputedStyle(element)
         if (!/(auto|scroll)/.test(style.overflowY)) continue
@@ -1525,6 +1707,246 @@ window.__ModuleLoader__.load({
       if (ranges.length > 0) CSS.highlights.set(KEYWORD_HIGHLIGHT, new Highlight(...ranges))
     }
 
+    // Reading positions and selected source passages stay in memory only.
+    const readingStore = {
+      value: { history: [], source: null, returning: false, travel: null },
+      listeners: new Set(), generation: 0, staged: null, lastSelection: null,
+      set(patch) {
+        this.value = { ...this.value, ...patch }
+        for (const listener of this.listeners) listener()
+      },
+      clear() {
+        this.generation++
+        this.staged = this.lastSelection = null
+        this.set({ history: [], source: null, returning: false, travel: null })
+      },
+    }
+
+    function useReading() {
+      return React.useSyncExternalStore(listener => {
+        readingStore.listeners.add(listener)
+        return () => readingStore.listeners.delete(listener)
+      }, () => readingStore.value)
+    }
+
+    function rangeElement(range) {
+      return range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer
+    }
+
+    function selectedPassage() {
+      const selection = window.getSelection()
+      if (!selection?.rangeCount || selection.isCollapsed) return null
+      const range = selection.getRangeAt(0)
+      const flow = findEvidenceFlow()
+      if (!flow?.contains(range.commonAncestorContainer)) return null
+      return { range: range.cloneRange(), quote: selection.toString(), rangeText: range.toString(), sessionId: sessionStore.id,
+        identity: messageIdentity(rangeElement(range)) }
+    }
+
+    function chatScrollers(flow) {
+      const scrollers = []
+      for (let node = flow; node && node !== document.body; node = node.parentElement) {
+        if (/(auto|scroll)/.test(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight + 1) {
+          scrollers.push({ node, top: node.scrollTop, left: node.scrollLeft })
+        }
+      }
+      return scrollers
+    }
+
+    function captureReading() {
+      const flow = findEvidenceFlow()
+      if (!flow || !sessionStore.id) return null
+      const selection = selectedPassage() || (readingStore.lastSelection?.sessionId === sessionStore.id ? readingStore.lastSelection : null)
+      const scrollers = chatScrollers(flow)
+      const viewport = (scrollers[0]?.node || flow).getBoundingClientRect()
+      const anchor = [...flow.querySelectorAll('[data-chat-node-key], [data-message-seq]')]
+        .find(row => { const rect = row.getBoundingClientRect(); return rect.bottom > viewport.top + 1 && rect.top < viewport.bottom })
+      const anchorIdentity = anchor && messageIdentity(anchor.querySelector('p, li, pre') || anchor)
+      return { sessionId: sessionStore.id, selection, scrollers, windowX: window.scrollX, windowY: window.scrollY,
+        anchor: anchorIdentity?.seq != null ? { identity: anchorIdentity,
+          offset: anchor.getBoundingClientRect().top - viewport.top } : null }
+    }
+
+    function beginReadingJump(sessionId, captured = false) {
+      const generation = ++readingStore.generation
+      if (!captured) {
+        const staged = readingStore.staged
+        const bookmark = staged && Date.now() - staged.at < 1500 ? staged.bookmark : captureReading()
+        readingStore.staged = null
+        if (bookmark) readingStore.set({ history: [...readingStore.value.history.slice(-9), bookmark] })
+      }
+      readingStore.set({ source: null, returning: false, travel: sessionId })
+      return generation
+    }
+
+    function rememberSource(range) {
+      const source = { range: range.cloneRange(), quote: window.getSelection()?.toString() || range.toString(), rangeText: range.toString(),
+        sessionId: sessionStore.id, identity: messageIdentity(rangeElement(range)) }
+      readingStore.lastSelection = source
+      readingStore.set({ source, travel: null })
+    }
+
+    function restoredRange(passage, flow) {
+      const live = passage?.range
+      if (live?.startContainer.isConnected && live.endContainer.isConnected &&
+          flow.contains(live.commonAncestorContainer) && live.toString() === (passage.rangeText ?? passage.quote)) return live.cloneRange()
+      if (!passage?.quote) return null
+      const flat = passage.quote.replace(/\s+/g, ' ').trim()
+      for (const row of sourceRows(flow, passage.identity)) {
+        const index = buildIndex(row)
+        const at = index?.text.indexOf(flat) ?? -1
+        // Refuse an ambiguous replacement after virtualization or editing.
+        if (at >= 0 && index.text.indexOf(flat, at + 1) < 0) return rangeAt(index, at, at + flat.length)
+      }
+      return null
+    }
+
+    async function returnToReading(ctx) {
+      const bookmark = readingStore.value.history.at(-1)
+      if (!bookmark || readingStore.value.returning) return false
+      const generation = ++readingStore.generation
+      readingStore.set({ returning: true, travel: bookmark.sessionId, source: null })
+      try {
+        if (sessionStore.id !== bookmark.sessionId && !openSessionById(ctx, bookmark.sessionId)) return false
+        const deadline = Date.now() + 25000
+        let loaded = false
+        while (Date.now() < deadline && generation === readingStore.generation) {
+          if (sessionStore.id !== bookmark.sessionId) { await new Promise(resolve => setTimeout(resolve, 100)); continue }
+          openChat(ctx, bookmark.sessionId)
+          const flow = findEvidenceFlow()
+          if (!flow) { await new Promise(resolve => setTimeout(resolve, 100)); continue }
+          expandSourceTurn(flow, bookmark.selection?.identity?.turn || bookmark.anchor?.identity?.turn)
+          const range = restoredRange(bookmark.selection, flow)
+          const rows = bookmark.anchor ? sourceRows(flow, bookmark.anchor.identity) : []
+          const anchor = rows.find(row => row !== flow)
+          if (bookmark.selection && !range || bookmark.anchor && !anchor) {
+            const seqs = [bookmark.selection?.identity?.seq, bookmark.anchor?.identity?.seq].filter(Number.isFinite)
+            if (!loaded && seqs.length) {
+              loaded = true
+              // Only request missing history; loading an already visible row can move the viewport.
+              const session = ctx.get('sessions')?.binding?.(bookmark.sessionId)?.session
+              if (typeof session?.loadThrough === 'function') void Promise.resolve(session.loadThrough(Math.min(...seqs))).catch(() => {})
+            }
+            await new Promise(resolve => setTimeout(resolve, 100)); continue
+          }
+          if (generation !== readingStore.generation) return false
+          if (range) {
+            const selection = window.getSelection()
+            selection.removeAllRanges(); selection.addRange(range)
+            if (supportsHighlight()) CSS.highlights.set(FOCUS_HIGHLIGHT, new Highlight(range))
+          } else window.getSelection()?.removeAllRanges()
+          const current = chatScrollers(flow)
+          // Preserve the visible row even when loading older messages changed its offset.
+          for (let index = 0; index < current.length; index++) {
+            const saved = bookmark.scrollers.find(item => item.node === current[index].node)
+            const top = anchor && index === 0
+              ? current[index].node.scrollTop + anchor.getBoundingClientRect().top - current[index].node.getBoundingClientRect().top - bookmark.anchor.offset
+              : saved?.top ?? bookmark.scrollers[index]?.top ?? current[index].top
+            current[index].node.scrollTo({ top, left: saved?.left ?? 0, behavior: 'instant' })
+          }
+          window.scrollTo({ top: bookmark.windowY, left: bookmark.windowX, behavior: 'instant' })
+          readingStore.lastSelection = range ? { ...bookmark.selection, range } : null
+          readingStore.set({ history: readingStore.value.history.slice(0, -1), source: range ? readingStore.lastSelection : null })
+          return true
+        }
+        return false
+      } finally {
+        if (generation === readingStore.generation) readingStore.set({ returning: false, travel: null })
+      }
+    }
+
+    function insertSourceDraft(ctx, source, en) {
+      if (!source?.quote?.trim() || source.sessionId !== sessionStore.id) return false
+      try {
+        const binding = ctx.get('sessions')?.binding?.(source.sessionId)
+        const input = ctx.get('conversation')?.input
+        const shell = binding?.ctx && typeof input?.for === 'function' ? input.for(binding.ctx) : input?.shell?.(source.sessionId)
+        const actions = shell?.actions
+        const state = shell?.state?.getSnapshot?.()
+        if (!actions?.captureInsertion || !actions?.insertText || ['adjudicating', 'submitting'].includes(state?.phase)) return false
+        const caret = actions.captureInsertion()
+        if (!Number.isFinite(caret?.end) || caret.draftRev == null) return false
+        const text = `\n\n${en ? 'About this passage:' : '关于这段原文：'}\n> ${source.quote.trim().replace(/\r\n?/g, '\n').replace(/\n/g, '\n> ')}\n\n`
+        // Collapse at the caret's end so even a selected draft is preserved.
+        const inserted = actions.insertText(text, { ...caret, start: caret.end, end: caret.end })
+        if (inserted !== true) return false
+        shell.focus?.()
+        return true
+      } catch { return false }
+    }
+
+    function SourceActions({ ctx, en, theme, fontSize, onReturn, onNotice, showReturn }) {
+      const reading = useReading()
+      const [position, setPosition] = React.useState(null)
+      const [insertError, setInsertError] = React.useState('')
+      const toolbar = React.useRef(null)
+      const inside = React.useRef(false)
+      const hideTimer = React.useRef(null)
+      React.useEffect(() => {
+        setPosition(null)
+        setInsertError('')
+        const source = reading.source
+        if (!source || source.sessionId !== sessionStore.id) return
+        const hide = () => { clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => {
+          if (!inside.current && !toolbar.current?.contains(document.activeElement)) setPosition(null)
+        }, 220) }
+        const move = event => {
+          if (toolbar.current?.contains(event.target)) { clearTimeout(hideTimer.current); return }
+          if (!source.range.startContainer.isConnected || source.sessionId !== sessionStore.id || window.getSelection()?.toString() !== source.quote) { setPosition(null); return }
+          const rect = [...source.range.getClientRects()].find(rect => rect.width > 0 && rect.height > 0 &&
+            event.clientX >= rect.left - 3 && event.clientX <= rect.right + 3 && event.clientY >= rect.top - 3 && event.clientY <= rect.bottom + 3)
+          if (!rect) { hide(); return }
+          const clip = chatScrollers(findEvidenceFlow())[0]?.node.getBoundingClientRect()
+          if (clip && (event.clientY < clip.top || event.clientY > clip.bottom)) { hide(); return }
+          clearTimeout(hideTimer.current)
+          setPosition({ left: Math.max(8, Math.min(window.innerWidth - 300, rect.left)),
+            top: rect.top > 50 ? rect.top - 43 : rect.bottom + 7 })
+        }
+        const moved = () => setPosition(null)
+        const selectionChanged = () => {
+          const selection = window.getSelection()
+          if (selection?.toString() !== source.quote && !toolbar.current?.contains(document.activeElement)) setPosition(null)
+        }
+        document.addEventListener('pointermove', move, { passive: true })
+        document.addEventListener('scroll', moved, true)
+        document.addEventListener('selectionchange', selectionChanged)
+        window.addEventListener('resize', moved)
+        return () => {
+          clearTimeout(hideTimer.current)
+          document.removeEventListener('pointermove', move)
+          document.removeEventListener('scroll', moved, true)
+          document.removeEventListener('selectionchange', selectionChanged)
+          window.removeEventListener('resize', moved)
+          inside.current = false
+        }
+      }, [reading.source])
+      const t = (zh, english) => en ? english : zh
+      const styles = { ...themeVars(theme), ...fontVars(fontSize) }
+      return h(React.Fragment, null,
+        position ? h('div', { ref: toolbar, className: 'dsp-source-actions', role: 'toolbar',
+          'aria-label': t('原文操作', 'Source actions'), style: { ...styles, ...position },
+          onPointerDown: event => event.preventDefault(),
+          onPointerEnter: () => { inside.current = true; clearTimeout(hideTimer.current) },
+          onPointerLeave: () => { inside.current = false; hideTimer.current = setTimeout(() => setPosition(null), 220) },
+          onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) setPosition(null) },
+        },
+          h('button', { type: 'button', className: 'dsp-source-insert', onClick: () => {
+            if (insertSourceDraft(ctx, reading.source, en)) {
+              setPosition(null)
+              onNotice(t('原文已加入输入框，可编辑后继续追问', 'Passage added to the draft. Edit it and ask a follow-up.'))
+            } else {
+              const message = t('暂时无法插入，请检查输入框是否可编辑。原文仍保留选中。', 'Could not insert. Check that the composer is editable. The source remains selected.')
+              setInsertError(message); onNotice(message)
+            }
+          } }, t('＋ 添加原文到输入框', '+ Add passage to draft')),
+          reading.history.length ? h('button', { type: 'button', disabled: reading.returning, onClick: onReturn }, t('↶ 返回', '↶ Back')) : null,
+          insertError ? h('span', { className: 'dsp-insert-error', role: 'status' }, insertError) : null,
+        ) : null,
+        showReturn && reading.history.length ? h('button', { type: 'button', className: 'dsp-reading-return', style: styles,
+          disabled: reading.returning, onClick: onReturn }, reading.returning ? t('正在返回…', 'Returning…') : t('↶ 返回刚才的位置', '↶ Back to reading')) : null,
+      )
+    }
+
     function focusQuote(quote, keywords) {
       const flow = findFlow()
       if (!flow) return false
@@ -1558,10 +1980,11 @@ window.__ModuleLoader__.load({
         CSS.highlights.set(FOCUS_HIGHLIGHT, new Highlight(range))
         paintKeywords(index, keywords)
       }
+      rememberSource(range)
       return true
     }
 
-    function focusEvidenceQuote(quote, keywords, identity) {
+    function focusEvidenceQuote(quote, keywords, identity, options = {}) {
       const flow = findEvidenceFlow()
       if (!flow) return false
       const flat = String(quote || '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim()
@@ -1587,7 +2010,7 @@ window.__ModuleLoader__.load({
       // not as a highlight that silently disappears.
       try {
         const selection = window.getSelection()
-        if (selection) {
+        if (selection && !options.search) {
           selection.removeAllRanges()
           selection.addRange(range)
         }
@@ -1598,13 +2021,32 @@ window.__ModuleLoader__.load({
         range.startContainer.nodeType === 3
           ? range.startContainer.parentElement
           : range.startContainer
-      if (host && typeof host.scrollIntoView === 'function') {
+      if (options.search && host) {
+        // A Markdown parent can span many screens. Center the Range's first
+        // line, rather than scrolling that whole parent to its beginning.
+        let scroller = host
+        let centered = false
+        while (scroller && scroller !== document.body) {
+          const style = window.getComputedStyle(scroller)
+          if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 1) {
+            const rect = [...range.getClientRects()].find(item => item.width > 0 && item.height > 0)
+            const viewport = scroller.getBoundingClientRect()
+            if (rect) scroller.scrollBy({ top: rect.top + rect.height / 2 - viewport.top - scroller.clientHeight / 2,
+              behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })
+            centered = Boolean(rect)
+            break
+          }
+          scroller = scroller.parentElement
+        }
+        if (!centered) host.scrollIntoView({ block: 'center' })
+      } else if (host && typeof host.scrollIntoView === 'function') {
         host.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })
       }
       if (supportsHighlight()) {
-        CSS.highlights.set(FOCUS_HIGHLIGHT, new Highlight(range))
-        paintKeywords(index, keywords)
+        CSS.highlights.set(options.search ? SEARCH_CURRENT_HIGHLIGHT : FOCUS_HIGHLIGHT, new Highlight(range))
+        if (!options.search) paintKeywords(index, keywords)
       }
+      if (!options.search) rememberSource(range)
       return true
     }
 
@@ -1822,6 +2264,7 @@ window.__ModuleLoader__.load({
         const [section, setSection] = React.useState('decisions')
         const [query, setQuery] = React.useState('')
         const [expanded, setExpanded] = React.useState(null)
+        const [archiveNotice, setArchiveNotice] = React.useState('')
 
         React.useEffect(() => {
           const focus = ledgerFocus.value
@@ -1830,8 +2273,8 @@ window.__ModuleLoader__.load({
           if (String(focus).startsWith('decision:')) {
             setSection('decisions')
             setExpanded(String(focus).slice('decision:'.length))
-          } else if (focus === 'section:assumptions') {
-            setSection('assumptions')
+          } else if (focus === 'section:assumptions' || focus === 'section:trash') {
+            setSection(String(focus).slice('section:'.length))
           }
         }, [])
 
@@ -1841,8 +2284,8 @@ window.__ModuleLoader__.load({
           if (String(request.focus).startsWith('decision:')) {
             setSection('decisions')
             setExpanded(String(request.focus).slice('decision:'.length))
-          } else if (request.focus === 'section:assumptions') {
-            setSection('assumptions')
+          } else if (request.focus === 'section:assumptions' || request.focus === 'section:trash') {
+            setSection(String(request.focus).slice('section:'.length))
           }
           props.completeViewRequest?.()
         }, [props.viewRequest])
@@ -1862,6 +2305,9 @@ window.__ModuleLoader__.load({
         const notes = ledger.notes.filter((item) =>
           inScope(item) &&
           (!needle || String(item.text || '').toLowerCase().includes(needle)))
+        const trash = ledger.trash.filter(entry => inScope(entry.item) && (!needle ||
+          [entry.item.text, entry.item.claim, entry.item.sourceClaim,
+            ...(entry.item.atoms || []).map(atom => atom.text)].join('\n').toLowerCase().includes(needle)))
         const openCount = assumptions.filter((item) => item.status === 'open').length
         const confirmedCount = assumptions.filter((item) => item.status === 'confirmed').length
 
@@ -1881,13 +2327,8 @@ window.__ModuleLoader__.load({
                 : item),
           }))
 
-        const removeDecision = (id) => {
-          if (!window.confirm(t('删除这条结论？', 'Delete this decision?'))) return
-          ledgerStore.update((current) => ({
-            ...current,
-            decisions: current.decisions.filter((item) => item.id !== id),
-          }))
-        }
+        const removeDecision = id => setArchiveNotice(recycleNotice(recycleLedgerItem('decisions', id), t))
+        const restoreItem = id => setArchiveNotice(recycleNotice(restoreLedgerItem(id), t))
 
         const exportLedger = () => {
           try {
@@ -2010,6 +2451,10 @@ window.__ModuleLoader__.load({
             className: 'dpl-btn' + (section === 'notes' ? ' active' : ''),
             onClick: () => setSection('notes'),
           }, t('摘录', 'Notes')),
+          h('button', {
+            type: 'button', className: 'dpl-btn' + (section === 'trash' ? ' active' : ''),
+            onClick: () => setSection('trash'),
+          }, `${t('回收站', 'Recycle bin')} · ${ledger.trash.filter(entry => inScope(entry.item)).length}`),
         )
 
         const renderDecision = (decision) => {
@@ -2027,9 +2472,9 @@ window.__ModuleLoader__.load({
             for (const item of atom.evidence || []) {
               rows.push(
                 h('div', { key: `e-${rows.length}`, className: 'dpl-ev-row' },
-                  h('span', { className: 'dpl-ev-role' },
-                    `${roleLabel(item.role, t)} #${item.seq}${item.turn ? ` · ${item.turn}` : ''}`),
-                  `「${item.quote}」`,
+                  h('span', { className: 'dpl-ev-role', title: `#${item.seq}${item.turn ? ` · ${item.turn}` : ''}` },
+                    roleLabel(item.role, t)),
+                  h(EvidenceQuote, { text: item.quote, en }),
                   item.url
                     ? h('a', {
                         href: item.url,
@@ -2051,9 +2496,8 @@ window.__ModuleLoader__.load({
           },
             h('div', { className: 'dpl-claim' }, decision.claim),
             h('div', { className: 'dpl-meta' },
-              h('span', null, new Date(decision.createdAt).toLocaleString()),
+              h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
               h('span', null, `${evidenceCount} ${t('条依据', 'sources')}`),
-              decision.sessionId ? h('span', null, `#${String(decision.sessionId).slice(-6)}`) : null,
               decision.status === 'revoked' ? h('span', null, t('已撤销', 'revoked')) : null,
             ),
             (decision.assumptions || []).length > 0
@@ -2105,31 +2549,21 @@ window.__ModuleLoader__.load({
           ),
         )
 
-        const removeNote = (id) => {
-          if (!window.confirm(t('删除这条摘录？', 'Delete this note?'))) return
-          ledgerStore.update((current) => ({
-            ...current,
-            notes: current.notes.filter((item) => item.id !== id),
-          }))
-        }
+        const removeNote = id => setArchiveNotice(recycleNotice(recycleLedgerItem('notes', id), t))
 
         const renderNote = (note) => h('div', { key: note.id, className: 'dpl-card' },
           h('div', { className: 'dpl-note' }, note.text),
           h('div', { className: 'dpl-meta' },
-            h('span', null, new Date(note.createdAt).toLocaleString()),
-            note.role ? h('span', null, `${roleLabel(note.role, t)} #${note.seq}`) : null,
-            note.sessionId ? h('span', null, `#${String(note.sessionId).slice(-6)}`) : null,
+            h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
           ),
           h('div', { className: 'dpl-actions' },
             h('button', {
               className: 'dpl-btn',
               type: 'button',
+              'data-dsp-jump': '',
               title: t('跳到这句原文', 'Jump to the source'),
               onClick: () => {
                 const quote = noteJumpText(note)
-                if (note.sessionId && note.sessionId !== sessionId) {
-                  openSessionById(ctx, note.sessionId)
-                }
                 window.dispatchEvent(new CustomEvent(JUMP_EVENT, {
                   detail: { quote, seq: note.seq, sessionId: note.sessionId },
                 }))
@@ -2143,7 +2577,9 @@ window.__ModuleLoader__.load({
           ),
         )
 
-        const content = section === 'decisions'
+        const content = section === 'trash'
+          ? h(RecycleBin, { entries: trash, en, archive: true, onRestore: restoreItem })
+          : section === 'decisions'
           ? (decisions.length === 0
               ? h('div', { className: 'dpl-empty' },
                   t('还没有结论。在任意回答上框选一句，点「存档这条结论」。',
@@ -2166,6 +2602,7 @@ window.__ModuleLoader__.load({
           header,
           stats,
           tabs,
+          archiveNotice ? h('div', { className: 'dpl-notice', role: 'status' }, archiveNotice) : null,
           content,
         )
       }
@@ -2341,6 +2778,79 @@ window.__ModuleLoader__.load({
       }
     }
 
+    const blankPanelQueries = () => ({ trace: '', notes: '', decisions: '', assumptions: '' })
+    const emptySearch = () => ({ status: 'idle', query: '', sessionId: null, hits: [], total: 0, offset: 0, hasMore: false, selected: -1 })
+    const searchText = value => String(value || '').replace(/\s+/g, ' ').trim()
+    function literalSearchPattern(query, flags = 'iu') {
+      const pattern = searchText(query).split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+')
+      return pattern ? new RegExp(pattern, flags) : null
+    }
+    function markedSearchText(text, query) {
+      const matcher = literalSearchPattern(query, 'giu')
+      if (!matcher) return text
+      const pieces = []
+      let last = 0
+      for (const match of String(text || '').matchAll(matcher)) {
+        pieces.push(String(text).slice(last, match.index), h('mark', { key: match.index, className: 'dsp-search-mark' }, match[0]))
+        last = match.index + match[0].length
+        if (pieces.length >= 200) break
+      }
+      pieces.push(String(text || '').slice(last))
+      return pieces
+    }
+    function clearSearchHighlights() {
+      if (!supportsHighlight()) return
+      CSS.highlights.delete(SEARCH_HIGHLIGHT)
+      CSS.highlights.delete(SEARCH_CURRENT_HIGHLIGHT)
+    }
+    function paintSearchMatches(query, hits) {
+      if (!supportsHighlight()) return
+      const flow = findEvidenceFlow()
+      const matcher = literalSearchPattern(query, 'giu')
+      if (!flow || !matcher) return
+      const ranges = []
+      const rows = new Set(hits.flatMap(hit => sourceRows(flow, hit)))
+      for (const row of rows) {
+        const index = buildIndex(row)
+        if (!index) continue
+        matcher.lastIndex = 0
+        for (const match of index.text.matchAll(matcher)) {
+          const range = rangeAt(index, match.index, match.index + match[0].length)
+          if (range) ranges.push(range)
+          if (ranges.length >= 400) break
+        }
+        if (ranges.length >= 400) break
+      }
+      CSS.highlights.set(SEARCH_HIGHLIGHT, new Highlight(...ranges))
+    }
+    function PanelSearchDock({ value, onChange, onComposing, placeholder, label, count, en }) {
+      const input = React.useRef(null)
+      const [pinned, setPinned] = React.useState(false)
+      const focus = () => { setPinned(true); input.current?.focus() }
+      return h('div', { className: 'dsp-search-dock' + (pinned || value ? ' open' : '') },
+        h('button', { type: 'button', className: 'dsp-search-peek', onClick: focus, tabIndex: -1, 'aria-label': placeholder },
+          h('span', null, label), h('small', null, '⌕', en ? 'Search' : '搜索')),
+        h('div', { className: 'dsp-search-form', role: 'search', 'aria-label': placeholder },
+          h('label', { className: 'dsp-search-input-wrap' },
+            h('span', { 'aria-hidden': true }, '⌕'),
+            h('input', { ref: input, className: 'dsp-search-input', type: 'search', value, maxLength: 6000,
+              placeholder, 'aria-label': placeholder, autoComplete: 'off', spellCheck: false,
+              onChange: event => onChange(event.target.value),
+              onCompositionStart: () => onComposing(true),
+              onCompositionEnd: event => { onChange(event.target.value); onComposing(false) },
+              onBlur: () => setPinned(false),
+              onKeyDown: event => {
+                if (event.nativeEvent?.isComposing) return
+                if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (value) onChange(''); else { setPinned(false); input.current?.blur() } }
+                if (event.key === 'Enter') event.preventDefault()
+              },
+            }),
+            value ? h('button', { type: 'button', className: 'dsp-search-clear', 'aria-label': en ? 'Clear search' : '清空搜索',
+              onClick: () => { onChange(''); input.current?.focus() } }, '×') : null),
+          h('span', { className: 'dsp-search-count', role: 'status', 'aria-live': 'polite' }, count)),
+      )
+    }
+
     function createPanel(ctx) {
       return function ProvenancePanel() {
         const sessionId = useActiveSession()
@@ -2352,6 +2862,21 @@ window.__ModuleLoader__.load({
 
         const [mode, setMode] = React.useState('idle')
         const [panelTab, setPanelTab] = React.useState('trace')
+        const [traceScope, setTraceScope] = React.useState('session')
+        const [relatedSelection, setRelatedSelection] = React.useState(null)
+        const [related, setRelated] = React.useState({ status: 'idle', hits: [] })
+        const [relations, setRelations] = React.useState({ status: 'idle', items: [] })
+        const [relatedRetry, setRelatedRetry] = React.useState(0)
+        const relatedAbortRef = React.useRef(null)
+        const relationsAbortRef = React.useRef(null)
+        const previousSessionRef = React.useRef(sessionId)
+        const [showTrash, setShowTrash] = React.useState(false)
+        const [recycleStatus, setRecycleStatus] = React.useState('')
+        const [panelQueries, setPanelQueries] = React.useState(blankPanelQueries)
+        const [searchComposing, setSearchComposing] = React.useState(false)
+        const [searchOffset, setSearchOffset] = React.useState(0)
+        const [traceSearch, setTraceSearch] = React.useState(emptySearch)
+        const searchJumpAbortRef = React.useRef(null)
         const [chromeVisible, setChromeVisible] = React.useState(false)
         const [hintMode, setHintMode] = React.useState('armed')
         const [claim, setClaim] = React.useState('')
@@ -2376,6 +2901,7 @@ window.__ModuleLoader__.load({
         const [noteSaved, setNoteSaved] = React.useState(false)
         const [minimized, setMinimized] = React.useState(false)
         const [notice, setNotice] = React.useState('')
+        const reading = useReading()
         const abortRef = React.useRef(null)
         const jumpAbortRef = React.useRef(null)
         const selectionRef = React.useRef({})
@@ -2390,9 +2916,21 @@ window.__ModuleLoader__.load({
         modeRef.current = mode
 
         const stopTracing = React.useCallback(() => {
+          pendingCrossJump.value = null
+          readingStore.clear()
+          relatedAbortRef.current?.abort()
+          relationsAbortRef.current?.abort()
+          setRelatedSelection(null)
+          setTraceScope('session')
+          setRelated({ status: 'idle', hits: [] })
+          setRelations({ status: 'idle', items: [] })
           window.clearTimeout(closingTimer.current)
           motionRef.current = false
           jumpAbortRef.current?.abort()
+          searchJumpAbortRef.current?.abort()
+          setPanelQueries(blankPanelQueries())
+          setSearchComposing(false)
+          setSearchOffset(0)
           abortRef.current?.abort()
           abortRef.current = null
           setClosing(false)
@@ -2409,6 +2947,8 @@ window.__ModuleLoader__.load({
           setNoteSaved(false)
           setMinimized(false)
           setPanelTab('trace')
+          setShowTrash(false)
+          setRecycleStatus('')
           setNotice('')
           setFilter('all')
           setFiltersOpen(false)
@@ -2420,7 +2960,17 @@ window.__ModuleLoader__.load({
 
         const runTrace = React.useCallback(
           async (quote, raw, identity) => {
+            setShowTrash(false)
+            readingStore.generation++
+            readingStore.set({ source: null, returning: false, travel: null })
+            readingStore.lastSelection = selectedPassage()
+            searchJumpAbortRef.current?.abort()
+            setPanelQueries(current => ({ ...current, trace: '' }))
             if (identity) selectionRef.current = identity
+            setTraceScope('session')
+            setRelatedSelection({ sessionId, quote, seq: selectionRef.current.seq,
+              role: selectionRef.current.role, messageId: selectionRef.current.messageId,
+              prefix: selectionRef.current.prefix, suffix: selectionRef.current.suffix })
             jumpAbortRef.current?.abort()
             if (!sessionId) {
               setError(t('没有会话上下文。', 'No session context.'))
@@ -2487,6 +3037,23 @@ window.__ModuleLoader__.load({
           selectionRef.current = {}
           abortRef.current?.abort()
           jumpAbortRef.current?.abort()
+          if (previousSessionRef.current !== sessionId) {
+            previousSessionRef.current = sessionId
+            if (readingStore.value.travel !== sessionId) readingStore.clear()
+            setRelatedSelection(null)
+            setTraceScope('session')
+            setRelated({ status: 'idle', hits: [] })
+            setRelations({ status: 'idle', items: [] })
+            setResult(null)
+            setClaim('')
+            setRawQuote('')
+            setError(null)
+            setErrorHint('')
+            setPinnedId(null)
+            setAssumptionsSaved(false)
+            setNoteSaved(false)
+            setMode(current => current === 'idle' ? 'idle' : 'armed')
+          }
         }, [sessionId])
 
         const runCorroborate = React.useCallback(async () => {
@@ -2571,10 +3138,35 @@ window.__ModuleLoader__.load({
           window.setTimeout(() => setNotice(''), 2600)
         }, [sessionId, en])
 
+        React.useEffect(() => {
+          const stage = event => {
+            if (!event.target?.closest?.('[data-dsp-jump]') || event.target.closest('.dsp-quote-toggle, .dsp-flag, a')) return
+            readingStore.staged = { at: Date.now(), bookmark: captureReading() }
+          }
+          const remember = () => { const selection = selectedPassage(); if (selection) readingStore.lastSelection = selection }
+          document.addEventListener('pointerdown', stage, true)
+          document.addEventListener('selectionchange', remember)
+          return () => {
+            document.removeEventListener('pointerdown', stage, true)
+            document.removeEventListener('selectionchange', remember)
+          }
+        }, [])
+
+        const backToReading = async () => {
+          jumpAbortRef.current?.abort()
+          searchJumpAbortRef.current?.abort()
+          try {
+            const returned = await returnToReading(ctx)
+            setNotice(returned ? t('已返回刚才的位置', 'Back to your reading position')
+              : t('暂未恢复原位置，原记录仍保留，可重试。', 'Could not restore the reading position yet. You can retry.'))
+          } catch { setNotice(t('暂未恢复原位置，可重试。', 'Could not restore the reading position. Retry.')) }
+        }
+
         /** Shared jump used by the Archive tab and the panel's Notes tab. */
         const runJump = React.useCallback((quote, seq, targetSessionId) => {
           if (!quote) return
           const jumpSession = targetSessionId || sessionId
+          const navigation = beginReadingJump(jumpSession)
           const switching = Boolean(jumpSession && jumpSession !== sessionId)
           if (switching) {
             // The note may belong to another conversation; open it first.
@@ -2607,6 +3199,11 @@ window.__ModuleLoader__.load({
             }
 
             const tryFocus = () => {
+              if (navigation !== readingStore.generation) return
+              if (sessionStore.id !== jumpSession) {
+                if (++attempts < 120) window.setTimeout(tryFocus, 150)
+                return
+              }
               // Whether a session switch has finished loading is not under
               // our control, so "is the chat flow mounted" has to be polled
               // on every attempt rather than guessed with one or two
@@ -2638,6 +3235,7 @@ window.__ModuleLoader__.load({
                       `Turn ${turn} did not land; retry or scroll to load older messages`)
                   : t('未能在对话中定位，可再点一次或手动滚动加载更早消息',
                       'Could not land in the chat; retry or scroll to load older messages'))
+                readingStore.set({ travel: null })
                 window.setTimeout(() => setNotice(''), 4200)
               }
             }
@@ -2646,12 +3244,15 @@ window.__ModuleLoader__.load({
         }, [sessionId, en, showOriginalFallback])
 
         /** Evidence cards use cancellable, message-addressed navigation. */
-        const runEvidenceJump = React.useCallback(async (quote, seq, targetSessionId, keywords = [], identity = {}) => {
+        const runEvidenceJump = React.useCallback(async (quote, seq, targetSessionId, keywords = [], identity = {}, options = {}) => {
           if (!quote) return
           jumpAbortRef.current?.abort()
+          searchJumpAbortRef.current?.abort()
           const controller = new AbortController()
-          jumpAbortRef.current = controller
+          if (options.search) searchJumpAbortRef.current = controller
+          else jumpAbortRef.current = controller
           const jumpSession = targetSessionId || sessionId
+          if (!options.search) beginReadingJump(jumpSession, options.captured)
           const pause = () => new Promise(resolve => window.setTimeout(resolve, 150))
           setOriginal(null)
           setNotice(t('正在定位原消息…', 'Locating the source message…'))
@@ -2679,10 +3280,11 @@ window.__ModuleLoader__.load({
                 loading = true
                 Promise.resolve(session.loadThrough(data.seq)).then(() => { loaded = true; loading = false }, () => { loaded = true; loading = false })
               }
+              if (options.search && loading) { await pause(); continue }
               expandSourceTurn(flow, data.turn)
-              if (focusEvidenceQuote(quote, keywords, data)) {
-                setNotice(t('已定位并选中原文', 'Source located and selected'))
-                return
+              if (focusEvidenceQuote(quote, keywords, data, options)) {
+                setNotice(options.search ? t('已定位匹配原文', 'Match located') : t('已定位并选中原文', 'Source located and selected'))
+                return true
               }
               if (!railClicked && (!session || loaded)) {
                 railClicked = data.turn ? clickTurnMark(data.turn) : navigateTurnForSeq(data.seq)
@@ -2692,10 +3294,161 @@ window.__ModuleLoader__.load({
             if (!controller.signal.aborted) setNotice(t('原消息尚未展开或当前 DSH 版本不支持定位，请展开该轮后重试。', 'Source is folded or this DSH version cannot navigate to it. Expand its turn and retry.'))
           } catch (cause) {
             if (!controller.signal.aborted) setNotice(cause instanceof Error ? cause.message : String(cause))
+          } finally {
+            if (!options.search && !controller.signal.aborted) readingStore.set({ travel: null })
           }
         }, [sessionId, en])
 
         const jumpTo = React.useCallback((item, keywords) => runEvidenceJump(item.quote, item.seq, sessionId, keywords, item), [runEvidenceJump, sessionId])
+
+        React.useEffect(() => {
+          if (!relatedSelection || relatedSelection.sessionId !== sessionId || mode === 'idle' || closing || minimized) {
+            setRelated({ status: 'idle', hits: [] })
+            return
+          }
+          const controller = new AbortController()
+          relatedAbortRef.current = controller
+          relationsAbortRef.current?.abort()
+          setRelated({ status: 'loading', hits: [] })
+          setRelations({ status: 'idle', items: [] })
+          const timer = window.setTimeout(() => {
+            void (async () => {
+              let scanId
+              try {
+                do {
+                  const response = await fetch(RELATED_ROUTE, { method: 'POST', credentials: 'same-origin',
+                    headers: { 'content-type': 'application/json' }, signal: controller.signal,
+                    body: JSON.stringify({ ...relatedSelection, ...(scanId ? { scanId } : {}) }) })
+                  const data = await response.json()
+                  if (!response.ok || !data?.ok) throw Object.assign(new Error(data?.message || t('关联检索暂不可用，请重试。', 'Related-session search unavailable. Retry.')), { code: data?.error })
+                  if (controller.signal.aborted) return
+                  scanId = data.scanId
+                  setRelated({ ...data, status: data.complete ? 'ready' : 'loading', hits: data.hits || [] })
+                  if (data.complete) break
+                  if (!scanId) throw new Error(t('关联检索未返回续查标识。', 'Missing search continuation.'))
+                } while (!controller.signal.aborted)
+              } catch (cause) {
+                if (!controller.signal.aborted) setRelated(current => ({ ...current,
+                  status: cause.code === 'related_unavailable' ? 'unavailable' : 'error', error: cause.message }))
+              }
+            })()
+          }, 550)
+          return () => { window.clearTimeout(timer); controller.abort() }
+        }, [relatedSelection, relatedRetry, sessionId, mode === 'idle', closing, minimized, en])
+
+        React.useEffect(() => {
+          if (traceScope !== 'all' || showTrash || panelTab !== 'trace' || closing || minimized) {
+            relationsAbortRef.current?.abort()
+            setRelations(current => current.status === 'loading' ? { status: 'idle', items: [] } : current)
+          }
+        }, [traceScope, showTrash, panelTab, closing, minimized])
+
+        const analyzeRelated = async () => {
+          if (!relatedSelection || !related.scanId || !related.hits.length || relations.status === 'loading') return
+          relationsAbortRef.current?.abort()
+          const controller = new AbortController()
+          relationsAbortRef.current = controller
+          setRelations({ status: 'loading', items: [] })
+          try {
+            const response = await fetch(RELATION_ROUTE, { method: 'POST', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' }, signal: controller.signal,
+              body: JSON.stringify({ ...relatedSelection, scanId: related.scanId }) })
+            const data = await response.json()
+            if (!response.ok || !data?.ok) throw new Error(data?.message || t('关系分析暂时失败，请重试。', 'Relationship analysis failed. Retry.'))
+            if (!controller.signal.aborted) setRelations({ status: 'done', items: data.relations || [], meta: data.meta })
+          } catch (cause) {
+            if (!controller.signal.aborted) setRelations({ status: 'error', items: [], error: cause.message })
+          }
+        }
+
+        const openRelated = hit => {
+          beginReadingJump(hit.sessionId)
+          pendingCrossJump.value = { ...hit, at: Date.now() }
+          if (!openSessionById(ctx, hit.sessionId)) {
+            pendingCrossJump.value = null
+            setNotice(t('当前 DSH 无法自动打开关联会话。', 'This DSH version cannot open the related session.'))
+          } else setNotice(t('正在打开关联会话并定位…', 'Opening the related session…'))
+        }
+
+        React.useEffect(() => {
+          const pending = pendingCrossJump.value
+          if (!pending || pending.sessionId !== sessionId) return
+          pendingCrossJump.value = null
+          if (Date.now() - pending.at > 30000) return
+          setMode('armed')
+          setMinimized(false)
+          setPanelTab('trace')
+          setTraceScope('session')
+          setShowTrash(false)
+          void runEvidenceJump(pending.quote, pending.seq, pending.sessionId, [], pending, { captured: true })
+        }, [sessionId, runEvidenceJump])
+
+        React.useEffect(() => {
+          setPanelQueries(blankPanelQueries())
+          setSearchOffset(0)
+          setSearchComposing(false)
+          setTraceSearch(emptySearch())
+          searchJumpAbortRef.current?.abort()
+          clearSearchHighlights()
+        }, [sessionId])
+
+        React.useEffect(() => {
+          clearSearchHighlights()
+          const query = searchText(panelQueries.trace)
+          if (traceScope === 'all' || showTrash || panelTab !== 'trace' || mode === 'idle' || closing || minimized || searchComposing || !query || !sessionId) {
+            setTraceSearch(emptySearch())
+            return
+          }
+          clearHighlights()
+          // A previous text selection can otherwise stay blue behind search matches.
+          // Input caret/selection is separate from document Selection in Chromium.
+          const selection = window.getSelection()
+          if (selection && !selection.isCollapsed) selection.removeAllRanges()
+          const controller = new AbortController()
+          setTraceSearch({ ...emptySearch(), sessionId, query, status: 'waiting' })
+          const timer = window.setTimeout(async () => {
+            setTraceSearch(current => ({ ...current, status: 'loading' }))
+            try {
+              const response = await fetch(SEARCH_ROUTE, { method: 'POST', credentials: 'same-origin',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ sessionId, query, offset: searchOffset }), signal: controller.signal })
+              const data = await response.json()
+              if (!response.ok || !data?.ok) throw new Error(data?.message || t('会话搜索暂不可用，请重载插件后重试。', 'Search unavailable. Reload the plugin and retry.'))
+              if (controller.signal.aborted) return
+              setTraceSearch({ ...data, sessionId, status: 'ready', selected: data.hits.length ? 0 : -1 })
+              if (data.hits[0]) void runEvidenceJump(data.hits[0].quote, data.hits[0].seq, sessionId, [], data.hits[0], { search: true })
+            } catch (cause) {
+              if (!controller.signal.aborted) setTraceSearch({ ...emptySearch(), sessionId, query, status: 'error', error: cause.message || String(cause) })
+            }
+          }, 450)
+          return () => { window.clearTimeout(timer); controller.abort(); searchJumpAbortRef.current?.abort(); clearSearchHighlights() }
+        }, [panelQueries.trace, panelTab, traceScope, showTrash, sessionId, searchOffset, searchComposing, mode === 'idle', closing, minimized, runEvidenceJump])
+
+        React.useEffect(() => {
+          if (traceScope === 'all' || showTrash || traceSearch.status !== 'ready' || traceSearch.sessionId !== sessionId || panelTab !== 'trace') return
+          let timer
+          const paint = () => paintSearchMatches(traceSearch.query, traceSearch.hits)
+          paint()
+          const flow = findEvidenceFlow()
+          const observer = new MutationObserver(() => { window.clearTimeout(timer); timer = window.setTimeout(paint, 80) })
+          if (flow) observer.observe(flow, { subtree: true, childList: true, characterData: true })
+          return () => { observer.disconnect(); window.clearTimeout(timer) }
+        }, [traceSearch, sessionId, panelTab, traceScope, showTrash])
+
+        React.useEffect(() => {
+          if (traceScope === 'session' && !showTrash && panelTab === 'trace' && !searchText(panelQueries.trace) && result && mode !== 'idle' && !minimized && !closing) paint(result, claim)
+        }, [panelTab, traceScope, panelQueries.trace, result, claim, mode, minimized, closing, showTrash])
+
+        React.useEffect(() => {
+          setShowTrash(false)
+          setRecycleStatus('')
+        }, [sessionId])
+
+        React.useEffect(() => {
+          if (noteSaved && !ledger.notes.some(item => item.sessionId === (sessionId || '') && item.text === (rawQuote || claim).trim())) setNoteSaved(false)
+          if (pinnedId && !ledger.decisions.some(item => item.id === pinnedId)) setPinnedId(null)
+          if (assumptionsSaved && (result?.assumptions || []).some(text => !ledger.assumptions.some(item => item.sessionId === (sessionId || '') && item.sourceClaim === claim && item.text === text))) setAssumptionsSaved(false)
+        }, [ledger, sessionId, rawQuote, claim, result, noteSaved, pinnedId, assumptionsSaved])
 
         React.useEffect(() => {
           const onJump = (event) => {
@@ -2755,7 +3508,9 @@ window.__ModuleLoader__.load({
             clearHighlights()
           }
           const onKey = (event) => {
+            if (event.isComposing) return
             if (event.key === 'Escape') {
+              if (event.target?.closest?.('.dsp-search-dock')) return
               // Let the settings popover consume Escape without exiting the mode.
               if (document.querySelector('.dsp-settings')) return
               stopTracing()
@@ -2779,7 +3534,7 @@ window.__ModuleLoader__.load({
           const onUp = (event) => {
             // Clicking our own hint or panel must never start a trace, even if
             // some text was still selected underneath.
-            if (event.target?.closest?.('.dsp-hint, .dsp-card, .dsp-pill')) return
+            if (event.target?.closest?.('.dsp-hint, .dsp-card, .dsp-pill, .dsp-source-actions, .dsp-reading-return')) return
             window.setTimeout(() => {
               if (modeRef.current === 'idle' || modeRef.current === 'loading') return
               const picked = readSelection()
@@ -2807,7 +3562,7 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (mode === 'idle') return undefined
           const onContext = (event) => {
-            if (event.target?.closest?.('.dsp-card, .dsp-pill, .dsp-hint')) return
+            if (event.target?.closest?.('.dsp-card, .dsp-pill, .dsp-hint, .dsp-source-actions, .dsp-reading-return')) return
             event.preventDefault()
             stopTracing()
           }
@@ -2871,8 +3626,11 @@ window.__ModuleLoader__.load({
 
         React.useEffect(
           () => () => {
+            relatedAbortRef.current?.abort()
+            relationsAbortRef.current?.abort()
             abortRef.current?.abort()
             jumpAbortRef.current?.abort()
+            searchJumpAbortRef.current?.abort()
             window.clearTimeout(closingTimer.current)
             clearHighlights()
           },
@@ -2884,6 +3642,7 @@ window.__ModuleLoader__.load({
           motionRef.current = true
           setClosing(true)
           jumpAbortRef.current?.abort()
+          searchJumpAbortRef.current?.abort()
           abortRef.current?.abort()
           traceModeStore.set(false)
           const finish = () => {
@@ -2905,6 +3664,7 @@ window.__ModuleLoader__.load({
         }
         const minimize = () => {
           if (motionRef.current) return
+          searchJumpAbortRef.current?.abort()
           motionRef.current = true
           setCollapsing(true)
           window.setTimeout(() => {
@@ -3086,13 +3846,8 @@ window.__ModuleLoader__.load({
           window.setTimeout(() => setNotice(''), 2500)
         }
 
-        const removeNote = (id) => {
-          if (!window.confirm(t('删除这条摘录？', 'Delete this note?'))) return
-          ledgerStore.update((current) => ({
-            ...current,
-            notes: current.notes.filter((item) => item.id !== id),
-          }))
-        }
+        const removeNote = id => setRecycleStatus(recycleNotice(recycleLedgerItem('notes', id), t))
+        const restoreItem = id => setRecycleStatus(recycleNotice(restoreLedgerItem(id), t))
 
         const jumpToNote = (note) => {
           runJump(noteJumpText(note), note.seq, note.sessionId)
@@ -3107,13 +3862,7 @@ window.__ModuleLoader__.load({
                 : item),
           }))
 
-        const removePanelDecision = (id) => {
-          if (!window.confirm(t('删除这条结论？', 'Delete this conclusion?'))) return
-          ledgerStore.update((current) => ({
-            ...current,
-            decisions: current.decisions.filter((item) => item.id !== id),
-          }))
-        }
+        const removePanelDecision = id => setRecycleStatus(recycleNotice(recycleLedgerItem('decisions', id), t))
 
         const setPanelAssumptionStatus = (id, status) =>
           ledgerStore.update((current) => ({
@@ -3122,13 +3871,7 @@ window.__ModuleLoader__.load({
               item.id === id ? { ...item, status } : item),
           }))
 
-        const removePanelAssumption = (id) => {
-          if (!window.confirm(t('删除这条假设？', 'Delete this assumption?'))) return
-          ledgerStore.update((current) => ({
-            ...current,
-            assumptions: current.assumptions.filter((item) => item.id !== id),
-          }))
-        }
+        const removePanelAssumption = id => setRecycleStatus(recycleNotice(recycleLedgerItem('assumptions', id), t))
 
         const goArchive = () => {
           const focus = pinnedId
@@ -3207,7 +3950,18 @@ window.__ModuleLoader__.load({
         const exportActive = () => {
           let text = ''
           let filename = 'provenance.md'
-          if (panelTab === 'trace') {
+          if (panelTab === 'trace' && traceScope === 'all') {
+            const lines = ['# 跨会话候选关联', '', `选句：${claim}`, '',
+              '候选关联不代表 AI 当时已引用这些会话；关系判断仍需核对原文。', '']
+            for (const hit of related.hits) {
+              const relation = relations.items.find(item => item.id === hit.id)
+              lines.push(`## ${hit.title || `会话 #${hit.sessionId.slice(-6)}`}`, `- 会话：${hit.sessionId} · ${hit.role} #${hit.seq}`,
+                `- 时间先后：${hit.timing}`, `> ${hit.quote}`, '')
+              if (relation) lines.push(`- 关系：${relation.relation}`, `- 说明：${relation.explanation}`, '')
+            }
+            text = lines.join('\n')
+            filename = 'provenance-related-conversations.md'
+          } else if (panelTab === 'trace') {
             text = traceMarkdown()
             filename = 'provenance-trace.md'
             if (!text) {
@@ -3256,7 +4010,7 @@ window.__ModuleLoader__.load({
 
         const style = h('style', { key: 'dsp-style' }, STYLES)
 
-        const parts = [style]
+        const parts = [style, h(SourceActions, { key: 'source-actions', ctx, en, theme, fontSize, onReturn: backToReading, onNotice: setNotice, showReturn: minimized || mode === 'idle' })]
         const active = mode !== 'idle'
 
         if (chromeVisible && chatRect) {
@@ -3314,15 +4068,26 @@ window.__ModuleLoader__.load({
         const sessionNotes = ledger.notes.filter((note) => note.sessionId === sessionId)
         const sessionDecisions = ledger.decisions.filter((item) => item.sessionId === sessionId)
         const sessionAssumptions = ledger.assumptions.filter((item) => item.sessionId === sessionId)
-        const tabTitle = panelTab === 'trace'
-          ? t('这句话的依据', 'Where this came from')
+        const sessionTrash = ledger.trash.filter(entry => entry.item.sessionId === sessionId)
+        const panelQuery = searchText(panelQueries[panelTab])
+        const localMatcher = panelQuery ? literalSearchPattern(panelQuery) : null
+        const matchesLocal = text => !localMatcher || localMatcher.test(String(text || ''))
+        const visibleNotes = sessionNotes.filter(note => matchesLocal(note.text))
+        const visibleDecisions = sessionDecisions.filter(item => matchesLocal([item.claim, ...(item.assumptions || [])].join('\n')))
+        const visibleAssumptions = sessionAssumptions.filter(item => matchesLocal([item.text, item.sourceClaim].join('\n')))
+        const liveSearch = traceSearch.sessionId === sessionId && traceSearch.query === panelQuery
+          ? traceSearch : { ...emptySearch(), status: 'waiting' }
+        const tabTitle = showTrash ? t('回收站', 'Recycle bin') : panelTab === 'trace' && traceScope === 'all'
+          ? t('跨会话关联', 'Related conversations') : panelTab === 'trace'
+          ? panelQuery ? t('查找与溯源', 'Find and trace') : t('这句话的依据', 'Where this came from')
           : panelTab === 'decisions'
             ? t('结论', 'Conclusions')
             : panelTab === 'assumptions'
               ? t('假设', 'Assumptions')
               : t('摘录', 'Notes')
-        const tabCount = panelTab === 'trace'
-          ? (result && result.atoms ? t(`${result.atoms.length} 个论断`, `${result.atoms.length} claims`) : null)
+        const tabCount = showTrash ? t(`${sessionTrash.length} 条 · 本对话`, `${sessionTrash.length} · this chat`) : panelTab === 'trace'
+          ? panelQuery ? (liveSearch.status === 'ready' ? t(`${liveSearch.total} 条匹配`, `${liveSearch.total} matches`) : null)
+            : (result && result.atoms ? t(`${result.atoms.length} 个论断`, `${result.atoms.length} claims`) : null)
           : panelTab === 'decisions'
             ? t(`${sessionDecisions.length} 条`, `${sessionDecisions.length} conclusions`)
             : panelTab === 'assumptions'
@@ -3330,14 +4095,33 @@ window.__ModuleLoader__.load({
               : t(`${sessionNotes.length} 条`, `${sessionNotes.length} notes`)
 
         if (idleEmpty) {
-          return chromeVisible ? h(React.Fragment, null, ...parts) : style
+          return h(React.Fragment, null, ...parts)
         }
 
         const header = h('div', { className: 'dsp-head', key: 'head' },
           h('span', { className: 'dsp-title' }, tabTitle),
-          tabCount ? h('span', { className: 'dsp-count' }, tabCount) : null,
+          tabCount && (showTrash || panelTab !== 'trace') ? h('span', { className: 'dsp-count' }, tabCount) : null,
           h('span', { className: 'dsp-head-spacer', key: 'spacer' }),
           h('div', { className: 'dsp-head-actions', key: 'actions' },
+            panelTab === 'trace' && !showTrash ? h('button', {
+              type: 'button', className: 'dsp-scope', 'aria-pressed': traceScope === 'all',
+              'aria-label': t('溯源范围', 'Trace scope'), disabled: !related.hits.length && traceScope !== 'all',
+              title: related.hits.length ? t('已发现其他会话的候选关联，点击切换查看。', 'Related passages found in other sessions. Click to view.')
+                : related.status === 'loading' ? t('正在本地检索其他会话，不调用模型。', 'Searching other sessions locally, without a model.')
+                : related.status === 'error' || related.status === 'unavailable' ? related.error
+                : related.failedSessions ? t('部分会话未能读取，暂未找到候选。', 'Some sessions could not be read; no candidates found.')
+                : relatedSelection ? t('暂未找到其他会话的相关候选。', 'No related passages found in other sessions.') : t('选中一句话后自动查找关联。', 'Select a passage to find related sessions.'),
+              onClick: () => setTraceScope(value => value === 'all' ? 'session' : 'all'),
+            }, t(traceScope === 'all' ? '全对话' : '本对话', traceScope === 'all' ? 'All chats' : 'This chat'),
+              h('span', { className: 'dsp-related-dot' + (related.hits.length ? ' found' : related.status === 'loading' ? ' searching' : ''), 'aria-hidden': true }),
+              h('span', { 'aria-hidden': true }, '⌄')) : null,
+            h('button', {
+              className: 'dsp-x dsp-trash-toggle', type: 'button',
+              'aria-label': t('回收站', 'Recycle bin'), 'aria-pressed': showTrash,
+              title: t('回收站：找回删除的内容', 'Recycle bin: restore deleted items'),
+              onClick: () => setShowTrash(value => !value),
+            }, h('svg', { viewBox: '0 0 24 24', width: 15, height: 15, fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round' },
+              h('path', { d: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7' }))),
             h(SettingsMenu, { key: 'settings' }),
             h('button', {
               className: 'dsp-x',
@@ -3349,7 +4133,7 @@ window.__ModuleLoader__.load({
                 viewBox: '0 0 24 24', width: 15, height: 15,
                 fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round',
               }, h('path', { d: 'M5 12h14' }))),
-            h('button', { className: 'dsp-x', onClick: close, title: t('关闭', 'Close'), 'aria-label': t('关闭', 'Close') },
+            h('button', { className: 'dsp-x dsp-close', onClick: close, title: t('关闭', 'Close'), 'aria-label': t('关闭', 'Close') },
               h('svg', {
                 viewBox: '0 0 24 24', width: 15, height: 15,
                 fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round',
@@ -3539,6 +4323,7 @@ window.__ModuleLoader__.load({
                     : visible.map((item, i) =>
                       h('div', {
                         key: `ev-${index}-${i}`,
+                        'data-dsp-jump': '',
                         className: 'dsp-ev' + (flagged.has(evidenceKey(item)) ? ' flagged' : ''),
                         role: 'button',
                         tabIndex: 0,
@@ -3552,8 +4337,7 @@ window.__ModuleLoader__.load({
                         title: t('点击跳到原文', 'Jump to the source'),
                       },
                         h('div', { className: 'dsp-ev-head' },
-                          h('span', { className: 'dsp-ev-role' }, roleLabel(item.role, t)),
-                          item.turn ? h('span', null, t(`第 ${item.turn} 轮`, `turn ${item.turn}`)) : null,
+                          h('span', { className: 'dsp-ev-role', title: `${roleLabel(item.role, t)} · #${item.seq}${item.turn ? ` · ${t('轮次', 'Turn')} ${item.turn}` : ''}` }, item.role === 'assistant' ? t('AI 回答', 'AI reply') : roleLabel(item.role, t)),
                           item.strength === 'partial' ? h('span', null, t('部分', 'partial')) : null,
                           item.url
                             ? h('a', {
@@ -3577,8 +4361,8 @@ window.__ModuleLoader__.load({
                             onKeyDown: (event) => event.stopPropagation(),
                           }, flagged.has(evidenceKey(item)) ? t('已标不准', 'Flagged') : t('不准', 'Wrong')),
                         ),
-                        h('div', { className: 'dsp-ev-quote' }, `「${item.quote}」`),
-                        item.why ? h('div', { className: 'dsp-ev-why' }, item.why) : null,
+                        h(EvidenceQuote, { text: item.quote, en }),
+                        item.why ? h('div', { className: 'dsp-ev-why' }, h('span', { className: 'dsp-why-label' }, t('关联理由', 'Why related')), item.why) : null,
                       ),
                     ),
                 atom.note ? h('div', { className: 'dsp-note' }, atom.note) : null,
@@ -3628,7 +4412,7 @@ window.__ModuleLoader__.load({
                         rel: 'noreferrer noopener',
                       }, '↗ ' + t('打开原句', 'Open')),
                     ),
-                    h('div', { className: 'dsp-ev-quote' }, `「${source.quote}」`),
+                    h(EvidenceQuote, { text: source.quote, en }),
                     source.why ? h('div', { className: 'dsp-ev-why' }, source.why) : null,
                   ),
                 )
@@ -3652,7 +4436,7 @@ window.__ModuleLoader__.load({
               { id: 'assumptions', label: `${t('假设', 'Assumptions')} · ${sessionAssumptions.length}` },
               { id: 'notes', label: `${t('摘录', 'Notes')} · ${sessionNotes.length}` },
             ],
-            active: panelTab, onSelect: setPanelTab, en,
+            active: panelTab, onSelect: value => { setPanelTab(value); setShowTrash(false); setRecycleStatus('') }, en,
           }),
           h('button', {
             className: 'dsp-tab-export',
@@ -3668,16 +4452,15 @@ window.__ModuleLoader__.load({
             body.push(h('div', { key: 'notes-empty', className: 'dsp-note' },
               t('还没有摘录。框选一句话，点「存为笔记」。', 'No notes yet. Select a passage and choose “Save as note”.')))
           } else {
-            for (const note of sessionNotes) {
+            for (const note of visibleNotes) {
               body.push(
                 h('div', { key: note.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text' }, note.text),
+                  h('div', { className: 'dsp-note-text' }, markedSearchText(note.text, panelQuery)),
                   h('div', { className: 'dsp-note-meta' },
-                    new Date(note.createdAt).toLocaleString(),
-                    note.role ? ` · ${roleLabel(note.role, t)} #${note.seq}` : '',
+                    h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
                   ),
                   h('div', { className: 'dsp-note-actions' },
-                    h('button', { className: 'dsp-btn', type: 'button', disabled: Boolean(note.sessionId && note.sessionId !== sessionId), onClick: () => jumpToNote(note) }, t('跳转原文', 'Jump')),
+                    h('button', { className: 'dsp-btn', type: 'button', disabled: Boolean(note.sessionId && note.sessionId !== sessionId), 'data-dsp-jump': '', onClick: () => jumpToNote(note) }, t('跳转原文', 'Jump')),
                     h('button', { className: 'dsp-btn danger', type: 'button', onClick: () => removeNote(note.id) }, t('删除', 'Delete')),
                   ),
                 ),
@@ -3690,21 +4473,21 @@ window.__ModuleLoader__.load({
             body.push(h('div', { key: 'decisions-empty', className: 'dsp-note' },
               t('还没有结论。在溯源结果里点「存档这条结论」。', 'No conclusions yet. Trace a sentence and archive it.')))
           } else {
-            for (const decision of sessionDecisions) {
+            for (const decision of visibleDecisions) {
               const evidenceCount = (decision.atoms || []).reduce((sum, atom) => sum + (atom.evidence ? atom.evidence.length : 0), 0)
               body.push(
                 h('div', { key: decision.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text', style: { fontWeight: 600 } }, decision.claim),
+                  h('div', { className: 'dsp-note-text', style: { fontWeight: 600 } }, markedSearchText(decision.claim, panelQuery)),
                   h('div', { className: 'dsp-note-meta' },
-                    new Date(decision.createdAt).toLocaleString(),
+                    h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
                     ` · ${evidenceCount} ${t('条依据', 'sources')}`,
                     decision.status === 'revoked' ? ` · ${t('已撤销', 'revoked')}` : '',
                   ),
                   (decision.assumptions || []).length > 0
-                    ? h('div', { className: 'dsp-asms' }, ...decision.assumptions.map((text, index) => h('span', { key: index, className: 'dsp-asm' }, text)))
+                    ? h('div', { className: 'dsp-asms' }, ...decision.assumptions.map((text, index) => h('span', { key: index, className: 'dsp-asm' }, markedSearchText(text, panelQuery))))
                     : null,
                   h('div', { className: 'dsp-note-actions' },
-                    h('button', { className: 'dsp-btn', type: 'button', onClick: () => runJump(decision.claim, decision.claimSeq, decision.sessionId) }, t('跳转原文', 'Jump')),
+                    h('button', { className: 'dsp-btn', type: 'button', 'data-dsp-jump': '', onClick: () => runJump(decision.claim, decision.claimSeq, decision.sessionId) }, t('跳转原文', 'Jump')),
                     h('button', { className: 'dsp-btn', type: 'button', onClick: () => togglePanelDecision(decision.id) }, decision.status === 'revoked' ? t('恢复', 'Restore') : t('撤销', 'Revoke')),
                     h('button', { className: 'dsp-btn danger', type: 'button', onClick: () => removePanelDecision(decision.id) }, t('删除', 'Delete')),
                   ),
@@ -3718,12 +4501,12 @@ window.__ModuleLoader__.load({
             body.push(h('div', { key: 'assumptions-empty', className: 'dsp-note' },
               t('还没有假设。溯源时模型会列出结论依赖但未证实的前提。', 'No assumptions yet. A trace records premises the answer relies on.')))
           } else {
-            for (const item of sessionAssumptions) {
+            for (const item of visibleAssumptions) {
               body.push(
                 h('div', { key: item.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text' }, item.text),
+                  h('div', { className: 'dsp-note-text' }, markedSearchText(item.text, panelQuery)),
                   item.sourceClaim
-                    ? h('div', { className: 'dsp-note-meta' }, `${t('来源', 'From')}：${item.sourceClaim.slice(0, 80)}`)
+                    ? h('div', { className: 'dsp-note-meta' }, `${t('来源', 'From')}：`, markedSearchText(panelQuery ? item.sourceClaim : item.sourceClaim.slice(0, 80), panelQuery))
                     : null,
                   h('div', { className: 'dsp-note-actions' },
                     ...STATUS_LABELS.map(([value, label]) =>
@@ -3744,28 +4527,80 @@ window.__ModuleLoader__.load({
             t('拖选聊天里的一句话开始溯源。', 'Select a sentence in the chat to trace it.')))
         }
 
+        if (panelTab !== 'trace' && panelQuery &&
+            !(panelTab === 'notes' ? visibleNotes.length : panelTab === 'decisions' ? visibleDecisions.length : visibleAssumptions.length)) {
+          body.push(h('div', { key: 'no-local-matches', className: 'dsp-note' },
+            t('当前标签没有匹配内容。可以换个词，或去当前对话里找。', 'No matches in this tab. Try another phrase or search the current chat.')),
+            h('button', { key: 'search-in-chat', className: 'dsp-btn', type: 'button', onClick: () => {
+              setPanelQueries(current => ({ ...current, trace: panelQuery })); setSearchOffset(0); setPanelTab('trace')
+            } }, t('去对话里找', 'Search in chat')))
+        }
+
+        if (panelTab === 'trace' && panelQuery) {
+          body.length = 0
+          const status = liveSearch.status
+          body.push(h('div', { key: 'search-summary', className: 'dsp-coverage', role: 'status' },
+            status === 'waiting' ? t('输入停顿后查找当前对话…', 'Searching after you finish typing…')
+              : status === 'loading' ? t('正在查找当前对话…', 'Searching this conversation…')
+              : status === 'error' ? liveSearch.error
+              : t(`找到 ${liveSearch.total} 条匹配消息 · 扫描 ${liveSearch.scannedMessages} 条`,
+                `${liveSearch.total} matching messages · ${liveSearch.scannedMessages} scanned`)))
+          if (status === 'ready') {
+            body.push(h('div', { key: 'search-explainer', className: 'dsp-note' },
+              t('间接溯源：先定位词句，再按需分析依据。搜索本身不调用模型。', 'Find a passage, then trace its basis if needed. Search itself does not call a model.')))
+            body.push(h('div', { key: 'search-results', className: 'dsp-search-results' },
+              ...liveSearch.hits.map((hit, index) => h('div', { key: hit.seq,
+                className: 'dsp-search-result' + (liveSearch.selected === index ? ' selected' : '') },
+                h('button', { type: 'button', className: 'dsp-search-hit', onClick: () => {
+                  setTraceSearch(current => ({ ...current, selected: index }))
+                  void runEvidenceJump(hit.quote, hit.seq, sessionId, [], hit, { search: true })
+                } },
+                  h('small', null, `${roleLabel(hit.role, t)} · #${hit.seq}${hit.turn ? ` · ${t('第', 'Turn ')}${hit.turn}${t('轮', '')}` : ''}`),
+                  hit.clippedBefore ? '…' : '', markedSearchText(hit.excerpt, panelQuery), hit.clippedAfter ? '…' : ''),
+                h('div', { className: 'dsp-note-actions' },
+                  h('button', { type: 'button', className: 'dsp-btn', onClick: () => void runTrace(hit.traceQuote, hit.traceQuote, hit) }, t('溯源这段', 'Trace this passage'))))),
+            ))
+            if (!liveSearch.total) body.push(h('div', { key: 'search-no-hits', className: 'dsp-note' },
+              t('当前对话没有匹配这段词句。可缩短词句后再试；这是文本匹配，不是语义问答。', 'No exact text match in this conversation. Try a shorter phrase; this is text search, not semantic Q&A.')))
+            if (liveSearch.offset > 0 || liveSearch.hasMore) body.push(h('div', { key: 'search-pages', className: 'dsp-search-pager' },
+              h('button', { type: 'button', className: 'dsp-btn', disabled: liveSearch.offset === 0,
+                onClick: () => { bodyRef.current?.scrollTo({ top: 0 }); setSearchOffset(Math.max(0, liveSearch.offset - liveSearch.limit)) } }, t('上一页', 'Previous page')),
+              h('span', { className: 'dsp-note' }, `${liveSearch.offset + 1}–${liveSearch.offset + liveSearch.hits.length} / ${liveSearch.total}`),
+              h('button', { type: 'button', className: 'dsp-btn', disabled: !liveSearch.hasMore,
+                onClick: () => { bodyRef.current?.scrollTo({ top: 0 }); setSearchOffset(liveSearch.offset + liveSearch.limit) } }, t('下一页', 'Next page'))))
+          }
+        }
+
         body.unshift(tabs)
 
+        const localTotal = panelTab === 'notes' ? sessionNotes.length : panelTab === 'decisions' ? sessionDecisions.length : sessionAssumptions.length
+        const localVisible = panelTab === 'notes' ? visibleNotes.length : panelTab === 'decisions' ? visibleDecisions.length : visibleAssumptions.length
+        const searchScope = panelTab === 'trace' ? t('当前对话', 'this conversation')
+          : panelTab === 'notes' ? t('当前摘录', 'these notes')
+          : panelTab === 'decisions' ? t('当前结论', 'these conclusions') : t('当前假设', 'these assumptions')
+        const searchDock = h(PanelSearchDock, { key: `panel-search-${panelTab}`, value: panelQueries[panelTab],
+          en, placeholder: t(`搜索${searchScope}…`, `Search ${searchScope}…`),
+          label: panelTab === 'trace' ? t('在对话里查找词句', 'Find a passage in this chat')
+            : t(`${localVisible}${panelQuery ? ` / ${localTotal}` : ''} 条${panelTab === 'notes' ? '摘录' : panelTab === 'decisions' ? '结论' : '假设'}`,
+              `${localVisible}${panelQuery ? ` / ${localTotal}` : ''} ${panelTab === 'notes' ? 'notes' : panelTab}`),
+          count: panelQuery ? panelTab === 'trace'
+            ? liveSearch.status === 'ready' ? `${liveSearch.total} ${t('条', 'hits')}` : liveSearch.status === 'error' ? '!' : '…'
+            : `${localVisible}/${localTotal}` : '',
+          onChange: value => { setPanelQueries(current => ({ ...current, [panelTab]: value })); if (panelTab === 'trace') setSearchOffset(0) },
+          onComposing: setSearchComposing,
+        })
+
+        // Keep the input in one stable parent while entering/leaving search.
         const footer = panelTab !== 'trace'
-          ? h('div', { className: 'dsp-foot', key: 'foot' },
-              h('span', null,
-                panelTab === 'notes'
-                  ? t(`${sessionNotes.length} 条摘录`, `${sessionNotes.length} notes`)
-                  : panelTab === 'decisions'
-                    ? t(`${sessionDecisions.length} 条结论`, `${sessionDecisions.length} conclusions`)
-                    : t(`${sessionAssumptions.length} 条假设`, `${sessionAssumptions.length} assumptions`)),
-              h('span', { style: { flex: 1 } }),
-            )
-          : !result && !error
-            ? null
-            : h('div', { className: 'dsp-foot dsp-foot-result', key: 'foot' },
+          ? null
+          : h('div', { className: 'dsp-foot dsp-foot-result', key: 'foot' },
                 h('div', { className: 'dsp-foot-top' },
                   h('div', { className: 'dsp-foot-aux' },
-                    pinnedId || assumptionsSaved
+                    !panelQuery && (pinnedId || assumptionsSaved)
                       ? h('button', { className: 'dsp-btn', type: 'button', onClick: goArchive },
                           t('查看档案', 'Archive'))
                       : null,
-                    result && original && (result.atoms || []).length === 0
+                    !panelQuery && result && original && (result.atoms || []).length === 0
                       ? h('button', {
                           className: 'dsp-btn',
                           type: 'button',
@@ -3776,15 +4611,9 @@ window.__ModuleLoader__.load({
                         }, t('打开对话', 'Open chat'))
                       : null,
                   ),
-                  h('div', { className: 'dsp-foot-stats' },
-                    result && result.meta
-                      ? `${result.meta.model || ''} · ${result.meta.elapsedMs || 0}ms`
-                        + (result.meta.cached ? t(' · 缓存', ' · cached') : '')
-                        + (result.meta.messageCount ? t(` · 全文扫描 ${result.meta.messageCount} 条`, ` · scanned ${result.meta.messageCount} messages`) : '')
-                        + (flagged.size ? t(` · 标记 ${flagged.size}`, ` · ${flagged.size} flagged`) : '')
-                      : ''),
+                  searchDock,
                 ),
-                h('div', { className: 'dsp-foot-grid' },
+                !panelQuery && (result || error) ? h('div', { className: 'dsp-foot-grid' },
                   h('button', {
                     className: 'dsp-btn dsp-foot-cell',
                     type: 'button',
@@ -3809,10 +4638,72 @@ window.__ModuleLoader__.load({
                     disabled: !result || Boolean(pinnedId),
                     onClick: pinDecision,
                   }, pinnedId ? t('已归档', 'Archived') : t('存档这条结论', 'Archive this conclusion')),
-                ),
+                ) : null,
               )
 
-        if (panelTab === 'trace' && result?.meta?.retrieval) body.push(h('div', { className: 'dsp-coverage', key: 'coverage' }, t(`全文扫描 ${result.meta.retrieval.scannedMessages} 条 · 模型核对 ${result.meta.retrieval.selectedPassages} 个片段。无共享词的语义关联可能漏检。`, `Scanned ${result.meta.retrieval.scannedMessages} messages; verified ${result.meta.retrieval.selectedPassages} passages. Semantic matches without shared terms may be missed.`)))
+        if (panelTab === 'trace' && !panelQuery && result?.meta?.retrieval) body.push(h('div', { className: 'dsp-coverage', key: 'coverage' }, t(`全文扫描 ${result.meta.retrieval.scannedMessages} 条 · 模型核对 ${result.meta.retrieval.selectedPassages} 个片段。无共享词的语义关联可能漏检。`, `Scanned ${result.meta.retrieval.scannedMessages} messages; verified ${result.meta.retrieval.selectedPassages} passages. Semantic matches without shared terms may be missed.`)))
+
+        const inRelated = panelTab === 'trace' && traceScope === 'all' && !showTrash
+        const relationLabels = {
+          similar: t('相似观点', 'Similar view'), supports: t('补充支持', 'Supporting context'),
+          changes: t('观点变化', 'Changed view'), contradicts: t('可能矛盾', 'Possible contradiction'),
+          unrelated: t('未确认关联', 'No confirmed connection'),
+        }
+        const retryRelated = () => { setRelations({ status: 'idle', items: [] }); setRelatedRetry(value => value + 1) }
+        const relatedIssue = related.status === 'error' || related.status === 'unavailable' || related.failedSessions > 0
+        if (inRelated) {
+          body.length = 0
+          body.push(tabs,
+            h('div', { key: 'related-claim', className: 'dsp-claim' }, `「${claim}」`),
+            h('div', { key: 'related-description', className: 'dsp-note' },
+              t('这些是其他会话中的候选关联，不代表 AI 当时引用过它们。先看原文，需要时再分析关系。',
+                'These are related passages from other sessions, not proof that the AI originally used them. Review the sources before analyzing.')),
+            h('div', { key: 'related-progress', className: 'dsp-note', role: 'status', 'aria-live': 'polite' },
+              t(`${related.status === 'loading' ? '正在本地查找' : '本地查找'} · ${related.scannedSessions || 0} / ${related.totalSessions || 0} 个其他会话 · ${related.hits.length} 条候选`,
+                `${related.status === 'loading' ? 'Searching locally' : 'Local search'} · ${related.scannedSessions || 0} / ${related.totalSessions || 0} other sessions · ${related.hits.length} candidates`)),
+            h('div', { key: 'related-tools', className: 'dsp-related-tools' },
+              h('button', { type: 'button', className: 'dsp-btn primary dsp-analyze-relations',
+                disabled: !related.hits.length || relations.status === 'loading', onClick: () => void analyzeRelated() },
+                relations.status === 'loading' ? t('正在分析关系…', 'Analyzing connections…')
+                  : relations.status === 'done' ? t('重新分析关系', 'Analyze connections again') : t('分析关系', 'Analyze connections')),
+              h('button', { type: 'button', className: 'dsp-btn', disabled: related.status === 'loading', onClick: retryRelated }, t('重新查找', 'Search again'))),
+            h('div', { key: 'related-budget', className: 'dsp-note' },
+              t('本地查找和切换不调用模型。仅点「分析关系」才使用模型；最多 6 条候选，额外片段合计不超过 6,000 字节。',
+                'Search and switching do not call a model. Analyze connections sends up to 6 candidates, with at most 6,000 bytes of extra passages.')),
+          )
+          if (relatedIssue) body.push(h('div', { key: 'related-error', className: 'dsp-note', role: 'status' },
+            related.error || t(`${related.failedSessions} 个会话未能读取，结果可能不完整。`, `${related.failedSessions} sessions could not be read. Results may be incomplete.`)))
+          if (relations.status === 'error') body.push(h('div', { key: 'relations-error', className: 'dsp-note', role: 'status' }, relations.error))
+          if (relations.status === 'done' && !relations.items.length) body.push(h('div', { key: 'relations-empty', className: 'dsp-note' }, t('模型未返回可核验的关系判断，可继续查看候选原文。', 'The model returned no verifiable connection. You can still review the candidate sources.')))
+          if (relations.meta?.claimTruncated) body.push(h('div', { key: 'relations-clipped', className: 'dsp-note' }, t('选句较长，本次关系分析只使用预算内的选句开头。', 'The selection was long; this analysis used its opening within the input budget.')))
+          for (const hit of related.hits) {
+            const relation = relations.items.find(item => item.id === hit.id)
+            body.push(h('div', { key: `related-${hit.id}`, className: 'dsp-note-item dsp-related-item' },
+              h('div', { className: 'dsp-related-title' }, hit.title || t(`会话 #${hit.sessionId.slice(-6)}`, `Conversation #${hit.sessionId.slice(-6)}`)),
+              h('div', { className: 'dsp-related-meta' }, h(CompactMeta, { time: hit.time, role: hit.role, seq: hit.seq, sessionId: hit.sessionId, en }),
+                h('span', null, hit.timing === 'after' ? t('晚于本条，不能作为当时的依据', 'Later than this passage; cannot be an earlier source')
+                  : hit.timing === 'before' ? t('早于本条', 'Earlier than this passage') : t('先后时间待确认', 'Relative time unknown'))),
+              h('div', { className: 'dsp-note-text' }, hit.quote),
+              relation ? h('div', { className: `dsp-related-explanation ${relation.relation}` },
+                h('b', { className: 'dsp-related-relation' }, `${relationLabels[relation.relation]} · `), relation.explanation) : null,
+              h('div', { className: 'dsp-note-actions' }, h('button', { type: 'button', className: 'dsp-btn dsp-open-related', 'data-dsp-jump': '',
+                onClick: () => openRelated(hit) }, t('打开会话并定位', 'Open source conversation'))),
+            ))
+          }
+        } else if (panelTab === 'trace' && !panelQuery && relatedIssue) {
+          body.push(h('div', { key: 'related-status', className: 'dsp-note', role: 'status' },
+            related.error || t('部分会话未能读取，关联检索可能不完整。', 'Some sessions could not be read. Related results may be incomplete.'), ' ',
+            h('button', { className: 'dsp-btn', type: 'button', onClick: retryRelated }, t('重试关联检索', 'Retry related search'))))
+        }
+
+        if (showTrash) {
+          body.length = 0
+          body.push(
+            h('button', { key: 'trash-back', className: 'dsp-btn', type: 'button',
+              style: { alignSelf: 'flex-start' }, onClick: () => setShowTrash(false) }, t('← 返回', '← Back')),
+            h(RecycleBin, { key: 'trash', entries: sessionTrash, en, onRestore: restoreItem }),
+          )
+        }
 
         parts.push(
           h('div', {
@@ -3829,9 +4720,14 @@ window.__ModuleLoader__.load({
             },
           },
             header,
-            notice ? h('div', { className: 'dsp-toast', key: 'toast' }, notice) : null,
+            recycleStatus ? h('div', { className: 'dsp-toast', key: 'recycle-status', role: 'status' }, recycleStatus)
+              : notice || reading.history.length ? h('div', { className: 'dsp-toast dsp-reading-notice', key: 'toast' },
+                reading.history.length ? h('button', { type: 'button', className: 'dsp-btn dsp-back-reading',
+                  disabled: reading.returning, onClick: backToReading }, reading.returning ? t('正在返回…', 'Returning…') : t('↶ 返回刚才的位置', '↶ Back to reading')) : null,
+                notice ? h('span', { role: 'status' }, notice) : null) : null,
             h('div', { className: 'dsp-body', ref: bodyRef, onWheel: bounceAtEdge }, ...body),
-            footer,
+            showTrash || inRelated ? null : footer,
+            showTrash || panelTab === 'trace' ? null : searchDock,
             h('div', {
               key: 'resize',
               className: 'dsp-resize',
@@ -3867,6 +4763,61 @@ window.__ModuleLoader__.load({
       if (role === 'user') return t('你的原话', 'Your words')
       if (role === 'assistant') return t('我之前的结论', 'Earlier conclusion')
       return t('外部材料', 'External material')
+    }
+
+    function compactDate(value, en, now = new Date()) {
+      const date = new Date(value == null || value === '' ? NaN : value)
+      if (!Number.isFinite(date.getTime())) return en ? 'Unknown time' : '时间未知'
+      const sameDay = (left, right) => left.getFullYear() === right.getFullYear()
+        && left.getMonth() === right.getMonth() && left.getDate() === right.getDate()
+      const yesterday = new Date(now); yesterday.setDate(yesterday.getDate() - 1)
+      const clock = date.toLocaleTimeString(en ? 'en-GB' : 'zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+      const day = sameDay(date, now) ? (en ? 'Today' : '今天')
+        : sameDay(date, yesterday) ? (en ? 'Yesterday' : '昨天')
+        : date.toLocaleDateString(en ? 'en-GB' : 'zh-CN', { ...(date.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}), month: 'numeric', day: 'numeric' })
+      return `${day} ${clock}`
+    }
+
+    function compactMeta({ time, role, seq, sessionId, en, prefix = '' }) {
+      const shortRole = role === 'assistant' ? (en ? 'AI reply' : 'AI 回答')
+        : role === 'user' ? (en ? 'Your words' : '你的话') : role ? (en ? 'Tool material' : '工具材料') : ''
+      const date = new Date(time == null || time === '' ? NaN : time)
+      const fullDate = Number.isFinite(date.getTime())
+        ? date.toLocaleString(en ? 'en-GB' : 'zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+        : en ? 'Unknown time' : '时间未知'
+      return {
+        label: [prefix + compactDate(time, en), shortRole].filter(Boolean).join(' · '),
+        title: [prefix + fullDate, shortRole, seq != null ? `${en ? 'Message' : '消息'} #${seq}` : '',
+          sessionId ? `${en ? 'Session' : '会话'} ${sessionId}` : ''].filter(Boolean).join(' · '),
+      }
+    }
+
+    function CompactMeta({ time, role, seq, sessionId, en, prefix, className }) {
+      const meta = compactMeta({ time, role, seq, sessionId, en, prefix })
+      return h('span', { className, title: meta.title }, meta.label)
+    }
+
+    function EvidenceQuote({ text, en }) {
+      const ref = React.useRef(null)
+      const [expanded, setExpanded] = React.useState(false)
+      const [overflow, setOverflow] = React.useState(false)
+      React.useEffect(() => setExpanded(false), [text])
+      React.useLayoutEffect(() => {
+        const element = ref.current
+        if (!element || expanded) return
+        const measure = () => setOverflow(element.scrollHeight > element.clientHeight + 1)
+        measure()
+        if (typeof ResizeObserver === 'undefined') return
+        const observer = new ResizeObserver(measure); observer.observe(element)
+        return () => observer.disconnect()
+      }, [text, expanded])
+      return h('div', { className: 'dsp-quote-wrap' },
+        h('div', { ref, className: 'dsp-ev-quote' + (expanded ? ' expanded' : ' clamped') }, `「${text}」`),
+        overflow || expanded ? h('button', { type: 'button', className: 'dsp-quote-toggle', 'aria-expanded': expanded,
+          title: en ? 'Expand or collapse the quote without jumping' : '仅展开或收起引文，不跳转',
+          onClick: event => { event.stopPropagation(); setExpanded(value => !value) },
+          onKeyDown: event => event.stopPropagation() }, expanded ? (en ? 'Collapse' : '收起') : (en ? 'Expand quote' : '展开引文')) : null,
+      )
     }
 
     return {

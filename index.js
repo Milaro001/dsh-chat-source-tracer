@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { retrieveAsync } from './retrieval.js'
+import { searchRelated, relationshipContext, validateRelationships, RELATION_SYSTEM, RELATION_KINDS } from './related.js'
 
 /**
  * dsh-provenance — Host half.
@@ -19,6 +20,9 @@ const MESSAGE_ROUTE = '/plugins/dsh-provenance-lens/message'
 const LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate'
 const EVIDENCE_LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate-evidence'
 const CORROBORATE_ROUTE = '/plugins/dsh-provenance-lens/corroborate'
+const SEARCH_ROUTE = '/plugins/dsh-provenance-lens/search'
+const RELATED_ROUTE = '/plugins/dsh-provenance-lens/related'
+const RELATION_ROUTE = '/plugins/dsh-provenance-lens/relationships'
 const BODY_LIMIT = 512 * 1024
 const MAX_ATOMS = 6
 const MAX_EVIDENCE_PER_ATOM = 3
@@ -55,6 +59,36 @@ export function apply(ctx) {
   route(LOCATE_ROUTE, locate)
   route(EVIDENCE_LOCATE_ROUTE, locateEvidence)
   route(CORROBORATE_ROUTE, corroborate)
+  route(SEARCH_ROUTE, searchSession)
+  route(RELATED_ROUTE, relatedSessions)
+  route(RELATION_ROUTE, analyzeRelationships)
+}
+
+const relatedHelpers = { collectEntries, resolveClaim, redactSecrets }
+const relationshipCache = new Map()
+
+async function relatedSessions(ctx, input, signal) {
+  try { return await searchRelated(ctx, input, signal, relatedHelpers) }
+  catch (error) {
+    signal?.throwIfAborted()
+    return { ok: false, error: 'related_failed', message: '关联检索暂未完成，请重试。' }
+  }
+}
+
+async function analyzeRelationships(ctx, input, signal) {
+  const context = await relationshipContext(ctx, input, signal, relatedHelpers)
+  const { provider, model } = await resolveModel(ctx)
+  const key = createHash('sha256').update(JSON.stringify([provider, model, context.claim, context.candidates])).digest('hex')
+  const cached = relationshipCache.get(key)
+  if (cached && Date.now() - cached.at < 5 * 60_000) return { ...cached.result, meta: { ...cached.result.meta, cached: true } }
+  const completion = await completeJson(ctx, { provider, model, signal, system: RELATION_SYSTEM,
+    prompt: JSON.stringify({ claim: context.claim, candidates: context.candidates }), kind: 'relationships',
+    maxTokens: 1536, retryMaxTokens: 2048 })
+  const relations = validateRelationships(completion.value, context)
+  const result = { ok: true, relations, meta: { ...context.meta, cached: false, modelOutput: completion.meta } }
+  if (relationshipCache.size >= 40) relationshipCache.delete(relationshipCache.keys().next().value)
+  relationshipCache.set(key, { at: Date.now(), result })
+  return result
 }
 
 async function serve(ctx, req, res, operation) {
@@ -457,10 +491,12 @@ async function completeJson(ctx, options) {
         maxTokens: attempt ? retryMaxTokens : maxTokens,
       })
       const value = parseJson(completion.text)
-      const key = kind === 'corroborate' ? 'picks' : 'atoms'
+      const key = kind === 'relationships' ? 'relations' : kind === 'corroborate' ? 'picks' : 'atoms'
       const rows = value?.[key]
       const valid = value && !Array.isArray(value) && Array.isArray(rows) &&
-        (kind === 'corroborate'
+        (kind === 'relationships'
+          ? rows.length > 0 && rows.length <= 6 && rows.every(row => row && typeof row.id === 'string' && RELATION_KINDS.includes(row.relation) && typeof row.quote === 'string' && typeof row.explanation === 'string')
+          : kind === 'corroborate'
           ? rows.length <= 3 && rows.every(row => row && typeof row.quote === 'string' && Number.isSafeInteger(Number(row.page)))
           : rows.length > 0 && rows.length <= MAX_ATOMS && rows.every(row => row && typeof row.text === 'string' && row.text.trim() && Array.isArray(row.evidence)))
       if (!valid) throw new AnalysisError('model_invalid_shape')
@@ -616,8 +652,9 @@ async function locateEvidence(ctx, input) {
   if (!quote) throw new Error('missing quote')
 
   if (quote.length > MAX_QUOTE_LENGTH) throw new Error('quote too long')
-  const snapshot = await ctx.sessionQuery.readSession(sessionId)
-  const entries = collectEntries(snapshot.events)
+  const currentSurface = input?.currentSurface === true && typeof ctx.sessionQuery.readSurface === 'function'
+  const snapshot = await (currentSurface ? ctx.sessionQuery.readSurface(sessionId) : ctx.sessionQuery.readSession(sessionId))
+  const entries = collectEntries(currentSurface ? snapshot.events.map(event => ({ ...event, surfaceOp: 'append' })) : snapshot.events)
   const entry = resolveClaim(entries, quote, input)
   if (!entry) return { ok: false, error: 'not_found', message: 'quote not found in session log' }
   const result = {
@@ -638,6 +675,55 @@ async function locateEvidence(ctx, input) {
  * so the browser may not hold the DOM row an evidence card points at; this
  * gives the panel an authoritative fallback for "show me the original".
  */
+/** Literal, local search over all readable messages, independent of model context limits. */
+async function searchSession(ctx, input, signal) {
+  const sessionId = String(input?.sessionId ?? '').trim()
+  const query = String(input?.query ?? '').replace(/\s+/g, ' ').trim()
+  if (!sessionId) throw new Error('missing sessionId')
+  if (!query) return { ok: true, query, hits: [], total: 0, offset: 0, hasMore: false }
+  if (query.length > MAX_QUOTE_LENGTH) throw new Error('query too long')
+  const offset = Math.max(0, Math.floor(Number(input?.offset) || 0))
+  if (!Number.isSafeInteger(offset)) throw new Error('invalid offset')
+  const limit = 40
+  // Escape every metacharacter: a typed query is never executable regular expression syntax.
+  const pattern = query.split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+')
+  const matcher = new RegExp(pattern, 'iu')
+  signal?.throwIfAborted()
+  const snapshot = await ctx.sessionQuery.readSession(sessionId)
+  signal?.throwIfAborted()
+  const entries = collectEntries(snapshot.events)
+  const hits = []
+  let total = 0
+  let scannedChars = 0
+  let work = 0
+  for (let i = 0; i < entries.length; i++) {
+    signal?.throwIfAborted()
+    const entry = entries[i]
+    const match = matcher.exec(entry.text)
+    scannedChars += entry.text.length
+    work += entry.text.length
+    if (match) {
+      if (total >= offset && hits.length < limit) {
+        const from = Math.max(0, match.index - 90)
+        const to = Math.min(entry.text.length, match.index + match[0].length + 130)
+        // Carry the actual matched spelling and message identity, never a synthesized quote.
+        const excerpt = entry.text.slice(from, to).replace(/\s+/g, ' ').trim()
+        hits.push({ seq: entry.seq, role: entry.role, turn: entry.turn, step: entry.step,
+          messageId: entry.messageId, quote: match[0].replace(/\s+/g, ' '),
+          excerpt, traceQuote: excerpt.length <= MAX_QUOTE_LENGTH ? excerpt : match[0].replace(/\s+/g, ' '), clippedBefore: from > 0, clippedAfter: to < entry.text.length })
+      }
+      total++
+    }
+    if (i % 64 === 63 || work >= 256000) {
+      await new Promise(resolve => setImmediate(resolve))
+      signal?.throwIfAborted()
+      work = 0
+    }
+  }
+  return { ok: true, query, hits, total, offset, limit, hasMore: offset + hits.length < total,
+    scannedMessages: entries.length, scannedChars }
+}
+
 async function readMessage(ctx, input) {
   const sessionId = String(input?.sessionId ?? '').trim()
   const seq = Number(input?.seq)
@@ -889,7 +975,7 @@ function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
-export { collectEntries, resolveClaim, validateAtoms, buildPrompt, trace, locate, locateEvidence, serve, complete, completeJson, errorReply, parseJson }
+export { collectEntries, resolveClaim, validateAtoms, buildPrompt, trace, locate, locateEvidence, searchSession, relatedSessions, analyzeRelationships, serve, complete, completeJson, errorReply, parseJson }
 
 // Compatibility path: preserve the already-working excerpt navigation.
 function resolveNoteQuote(entries, quote) {
