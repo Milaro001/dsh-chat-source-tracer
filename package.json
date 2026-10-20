@@ -1,6 +1,6 @@
 {
   "name": "dsh-provenance-lens",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Trace conversation sources, search across chats, manage excerpts and decisions, and quote original passages to continue a discussion.",
   "type": "module",
   "license": "MIT",

@@ -7,7 +7,7 @@ const source = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 function load() {
   const browser = { __ModuleLoader__: { load({ factory }) { factory(() => ({})) } } }
   vm.runInNewContext(source.replace("    return {\n      inject: ['slots'],",
-    "    window.readingTest = { compactDate, compactMeta, insertSourceDraft, sessionStore };\n    return {\n      inject: ['slots'],"), { window: browser })
+    "    window.readingTest = { compactDate, compactMeta, prepareSourceFollowup, sessionStore };\n    return {\n      inject: ['slots'],"), { window: browser })
   assert.ok(browser.readingTest)
   return browser.readingTest
 }
@@ -46,15 +46,15 @@ function composer(api, options = {}) {
   return { ctx, state, result: () => ({ inserted, focused, submitted }) }
 }
 
-test('source insertion preserves selected draft text and attachments, uses revision checks, and never submits', () => {
+test('source follow-up keeps the exact quote, draft and attachments, with a focused question prompt and no submit', () => {
   const api = load()
   const c = composer(api)
-  assert.equal(api.insertSourceDraft(c.ctx, { sessionId: 'synthetic', quote: '第一段原文\n第二段原文' }, false), true)
+  assert.equal(api.prepareSourceFollowup(c.ctx, { sessionId: 'synthetic', quote: '第一段原文\n第二段原文' }, false), true)
   const result = c.result()
   assert.equal(result.inserted.span.start, 4)
   assert.equal(result.inserted.span.end, 4)
   assert.equal(result.inserted.span.draftRev, 7)
-  assert.match(c.state.draft, /^已经写好\n\n关于这段原文：\n> 第一段原文\n> 第二段原文\n\n的问题$/)
+  assert.match(c.state.draft, /^已经写好\n\n请基于以下原文回答我的追问：\n> 第一段原文\n> 第二段原文\n\n我的追问：的问题$/)
   assert.deepEqual(c.state.attachmentIds, ['existing-file'])
   assert.equal(result.focused, true)
   assert.equal(result.submitted, false)
@@ -64,13 +64,13 @@ test('stale drafts, another session, unavailable APIs and a submitting composer 
   const api = load()
   for (const options of [{ draftRev: 8 }, { phase: 'submitting' }, { phase: 'adjudicating' }]) {
     const c = composer(api, options)
-    assert.equal(api.insertSourceDraft(c.ctx, { sessionId: 'synthetic', quote: '原文' }, false), false)
+    assert.equal(api.prepareSourceFollowup(c.ctx, { sessionId: 'synthetic', quote: '原文' }, false), false)
     assert.equal(c.state.draft, '已经写好的问题')
     assert.equal(c.result().focused, false)
     assert.equal(c.result().submitted, false)
   }
   const c = composer(api)
-  assert.equal(api.insertSourceDraft(c.ctx, { sessionId: 'other', quote: '原文' }, false), false)
-  assert.equal(api.insertSourceDraft({ get() { return null } }, { sessionId: 'synthetic', quote: '原文' }, false), false)
+  assert.equal(api.prepareSourceFollowup(c.ctx, { sessionId: 'other', quote: '原文' }, false), false)
+  assert.equal(api.prepareSourceFollowup({ get() { return null } }, { sessionId: 'synthetic', quote: '原文' }, false), false)
   assert.equal(c.result().inserted, null)
 })

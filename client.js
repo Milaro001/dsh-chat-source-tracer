@@ -94,6 +94,27 @@ window.__ModuleLoader__.load({
 
     /* ------------------------------------------------------------- ledger --- */
 
+    const TRASH_MAX_ITEMS = 50
+    const TRASH_RETENTION_DAYS = 30
+    const TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    let ledgerWritePending = false
+
+    function retainTrash(entries, now = Date.now()) {
+      return entries.filter(validTrashEntry).map(entry => {
+        // Older malformed timestamps receive one retention window, saved on
+        // migration. Clamp future dates so they cannot escape expiry forever.
+        const deletedAt = Number.isFinite(entry.deletedAt) && entry.deletedAt >= 0
+          ? Math.min(entry.deletedAt, now) : now
+        return deletedAt === entry.deletedAt ? entry : { ...entry, deletedAt }
+      }).filter(entry => now - entry.deletedAt <= TRASH_RETENTION_MS)
+        .sort((left, right) => right.deletedAt - left.deletedAt)
+        .slice(0, TRASH_MAX_ITEMS)
+    }
+
+    function sameTrash(left, right) {
+      return left.length === right.length && left.every((entry, index) => entry === right[index])
+    }
+
     function emptyLedger() {
       return { decisions: [], assumptions: [], notes: [], trash: [] }
     }
@@ -102,12 +123,16 @@ window.__ModuleLoader__.load({
       try {
         const raw = JSON.parse(localStorage.getItem(LEDGER_KEY) || 'null')
         if (raw && Array.isArray(raw.decisions) && Array.isArray(raw.assumptions)) {
-          return {
+          const ledger = {
             decisions: raw.decisions,
             assumptions: raw.assumptions,
             notes: Array.isArray(raw.notes) ? raw.notes : [],
-            trash: Array.isArray(raw.trash) ? raw.trash.filter(validTrashEntry) : [],
+            trash: Array.isArray(raw.trash) ? raw.trash : [],
           }
+          const trash = retainTrash(ledger.trash)
+          const next = { ...ledger, trash }
+          if (!sameTrash(ledger.trash, trash)) saveLedger(next)
+          return next
         }
       } catch {
         // Corrupt or missing storage starts an empty archive.
@@ -118,9 +143,11 @@ window.__ModuleLoader__.load({
     function saveLedger(value) {
       try {
         localStorage.setItem(LEDGER_KEY, JSON.stringify(value))
+        ledgerWritePending = false
         return true
       } catch {
         // The in-memory archive still works when storage is denied.
+        ledgerWritePending = true
         return false
       }
     }
@@ -129,6 +156,8 @@ window.__ModuleLoader__.load({
     const ledgerStore = {
       value: loadLedger(),
       listeners: new Set(),
+      retentionTimer: null,
+      retentionWake: null,
       get() {
         return this.value
       },
@@ -141,6 +170,7 @@ window.__ModuleLoader__.load({
         }
         // Older save paths return only the three active collections.
         const next = { ...current, ...mutator(current) }
+        next.trash = retainTrash(next.trash)
         const persisted = saveLedger(next)
         // Never remove an item if its recoverable copy cannot be saved.
         if (requirePersistence && !persisted) return false
@@ -148,9 +178,35 @@ window.__ModuleLoader__.load({
         for (const listener of this.listeners) listener()
         return persisted
       },
+      prune() {
+        const trash = retainTrash(this.value.trash)
+        if (sameTrash(trash, this.value.trash) && !ledgerWritePending) return true
+        const next = { ...this.value, trash }
+        if (!saveLedger(next)) return false
+        this.value = next
+        for (const listener of this.listeners) listener()
+        return true
+      },
       subscribe(listener) {
         this.listeners.add(listener)
-        return () => this.listeners.delete(listener)
+        if (this.listeners.size === 1) {
+          this.prune()
+          // One sweep per minute while the plugin is running; waking a
+          // suspended app checks immediately, as does every archive update.
+          if (typeof window.setInterval === 'function') this.retentionTimer = window.setInterval(() => this.prune(), 60000)
+          this.retentionWake = () => this.prune()
+          if (typeof window.addEventListener === 'function') window.addEventListener('focus', this.retentionWake)
+          if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.retentionWake)
+        }
+        return () => {
+          this.listeners.delete(listener)
+          if (this.listeners.size) return
+          if (this.retentionTimer !== null) window.clearInterval(this.retentionTimer)
+          if (typeof window.removeEventListener === 'function') window.removeEventListener('focus', this.retentionWake)
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.retentionWake)
+          this.retentionTimer = null
+          this.retentionWake = null
+        }
       },
     }
 
@@ -183,6 +239,7 @@ window.__ModuleLoader__.load({
     }
 
     function restoreLedgerItem(id) {
+      if (!ledgerStore.prune()) return 'storage-error'
       const entry = ledgerStore.get().trash.find(record => record.id === id)
       if (!entry) return 'missing'
       // Keep both versions if an active record already owns this identity.
@@ -197,7 +254,7 @@ window.__ModuleLoader__.load({
     }
 
     function recycleNotice(status, t) {
-      if (status === 'moved') return t('已移入回收站，可随时恢复。', 'Moved to the recycle bin. You can restore it anytime.')
+      if (status === 'moved') return t(`已移入回收站，最多保留 ${TRASH_MAX_ITEMS} 条，超过 ${TRASH_RETENTION_DAYS} 天或容量上限自动清理。`, `Moved to the recycle bin. Items beyond ${TRASH_RETENTION_DAYS} days or the ${TRASH_MAX_ITEMS}-item limit are removed automatically.`)
       if (status === 'restored') return t('已恢复到原来的分类。', 'Restored to its original category.')
       if (status === 'duplicate') return t('原列表已有同编号内容，这条记录仍保留在回收站。', 'An active record has the same ID. This copy remains in the recycle bin.')
       if (status === 'storage-error') return t('本机保存失败，内容未移动。请先导出备份，再重试。', 'Local save failed; nothing was moved. Export a backup before retrying.')
@@ -211,14 +268,15 @@ window.__ModuleLoader__.load({
         : kind === 'decisions' ? t('结论', 'Conclusion') : t('假设', 'Assumption')
       return h('div', { className: 'dpr-list', role: 'region', 'aria-label': t('回收站内容', 'Recycle bin contents') },
         h('div', { className: `${prefix}-note dpr-hint` },
-          t('删除的内容保留在这里，恢复后回到原来的分类。', 'Deleted items stay here. Restore them to their original category.')),
+          t(`所有会话合计最多 ${TRASH_MAX_ITEMS} 条；移入超过 ${TRASH_RETENTION_DAYS} 天自动清理，超出容量时优先清理最早移入的内容。`, `Up to ${TRASH_MAX_ITEMS} items across all conversations. Items older than ${TRASH_RETENTION_DAYS} days expire; the oldest deleted items are removed first when full.`)),
         entries.length ? entries.map(entry => h('div', {
           key: entry.id, className: archive ? 'dpl-card' : 'dsp-note-item', 'data-trash-id': entry.id,
         },
           h('div', { className: 'dpr-kind' }, kindLabel(entry.kind)),
-          h('div', { className: archive ? 'dpl-note' : 'dsp-note-text' }, entry.item.text || entry.item.claim),
-          h('div', { className: archive ? 'dpl-meta' : 'dsp-note-meta' },
-            h(CompactMeta, { time: entry.deletedAt, en, prefix: t('删除于 ', 'Deleted ') })),
+          h(CollapsibleText, { text: entry.item.text || entry.item.claim, en, variant: 'record', className: archive ? 'dpl-note' : 'dsp-note-text',
+            metadata: h('div', { className: archive ? 'dpl-meta' : 'dsp-note-meta' },
+              h(CompactMeta, { time: entry.deletedAt, en, prefix: t('删除于 ', 'Deleted ') })),
+          }),
           h('div', { className: archive ? 'dpl-actions' : 'dsp-note-actions' },
             h('button', { type: 'button', className: `${prefix}-btn`, onClick: () => onRestore(entry.id),
               title: t('恢复到', 'Restore to ') + kindLabel(entry.kind) }, t('恢复', 'Restore'))),
@@ -227,25 +285,22 @@ window.__ModuleLoader__.load({
     }
 
     /** Hand a focus identity to the Archive view and activate its tab. */
-    const ledgerFocus = { value: null }
+    const ledgerFocus = { value: null, sessionId: null }
+    const LEDGER_FOCUS_EVENT = 'dsh-provenance:focus-archive'
 
     function openLedger(ctx, sessionId, focus) {
       ledgerFocus.value = focus || null
-      try {
-        const ui = ctx.get('uiConversation')
-        const binding = ui?.binding?.(sessionId)
-        if (binding && typeof binding.activate === 'function') {
-          binding.activate('ledger')
-          return true
-        }
-      } catch {
-        // Activation is best effort; the tab is always one click away.
-      }
-      return false
+      ledgerFocus.sessionId = sessionId
+      // binding.activate() assembles target data; only the native tab also
+      // updates the shell's selected view. Follow that same click path.
+      const opened = clickConversationTab(['档案', 'Archive'], sessionId)
+      if (opened) window.dispatchEvent(new CustomEvent(LEDGER_FOCUS_EVENT, { detail: { sessionId } }))
+      return opened
     }
 
     /** Switch the conversation back to the chat view before focusing text. */
     function openChat(ctx, sessionId) {
+      if (clickConversationTab(['对话', 'Chat'], sessionId)) return true
       try {
         const ui = ctx.get('uiConversation')
         const binding = ui?.binding?.(sessionId)
@@ -277,25 +332,35 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * Last-resort view switch: click the visible "对话" tab. The service route
-     * can be unavailable in some view states, but the tab always works.
-     */
-    function clickChatTab() {
-      const labels = ['对话', 'Chat']
-      const roots = [document.querySelector('[role="tablist"]'), document]
+    /** Select the resident shell tab, scoped to the requested conversation. */
+    function clickConversationTab(labels, sessionId) {
+      const roots = []
+      if (sessionId) {
+        for (const occurrence of document.querySelectorAll(`[data-conversation-session="${CSS.escape(sessionId)}"]`)) {
+          let root = occurrence
+          for (let depth = 0; root && depth < 8; depth++, root = root.parentElement) {
+            const tabs = root.querySelector('[data-conversation-tabs]')
+            if (tabs) { roots.push(tabs); break }
+          }
+        }
+      }
+      if (!roots.length) roots.push(...document.querySelectorAll('[data-conversation-tabs], [role="tablist"]'))
       for (const root of roots) {
-        if (!root) continue
         for (const element of root.querySelectorAll('button, [role="tab"], a')) {
           if (element.closest('.dsp-card, .dsp-pill, .dsp-hint, .dsp-source-actions, .dsp-reading-return')) continue
           const text = (element.textContent || '').trim()
-          if (labels.includes(text)) {
-            element.click()
+          const rect = element.getBoundingClientRect()
+          if (labels.includes(text) && !element.disabled && rect.width && rect.height && getComputedStyle(element).visibility !== 'hidden') {
+            if (element.getAttribute('aria-selected') !== 'true') element.click()
             return true
           }
         }
       }
       return false
+    }
+
+    function clickChatTab() {
+      return clickConversationTab(['对话', 'Chat'], sessionStore.id)
     }
 
     function findTurnRail() {
@@ -487,6 +552,7 @@ window.__ModuleLoader__.load({
 
     const THEME_KEY = 'dsh-provenance:theme:v1'
     const FONT_KEY = 'dsh-provenance:font:v1'
+    const THINKING_EFFECTS_KEY = 'dsh-provenance:thinking-effects:v1'
 
     /** Accent-only palettes: surfaces stay on host tokens so light/dark still work. */
     const THEMES = [
@@ -599,6 +665,34 @@ window.__ModuleLoader__.load({
 
     function fontVars(size) {
       return { '--dsp-fs': `${size}px` }
+    }
+
+    function loadThinkingEffects() {
+      try { return localStorage.getItem(THINKING_EFFECTS_KEY) !== 'false' }
+      catch { return true }
+    }
+
+    const thinkingEffectsStore = {
+      enabled: loadThinkingEffects(),
+      listeners: new Set(),
+      set(enabled) {
+        const next = Boolean(enabled)
+        if (next === this.enabled) return
+        this.enabled = next
+        try { localStorage.setItem(THINKING_EFFECTS_KEY, String(next)) } catch {}
+        for (const listener of this.listeners) listener()
+      },
+      subscribe(listener) {
+        this.listeners.add(listener)
+        return () => this.listeners.delete(listener)
+      },
+    }
+
+    function useThinkingEffects() {
+      return React.useSyncExternalStore(
+        listener => thinkingEffectsStore.subscribe(listener),
+        () => thinkingEffectsStore.enabled,
+      )
     }
 
     const TAB_ORDER_KEY = 'dsh-provenance:panel-tab-order:v1'
@@ -807,6 +901,7 @@ window.__ModuleLoader__.load({
     function SettingsMenu() {
       const fontSize = useFontSize()
       const tabOrder = useTabOrder()
+      const thinkingEffects = useThinkingEffects()
       const [open, setOpen] = React.useState(false)
       const wrapRef = React.useRef(null)
 
@@ -846,8 +941,8 @@ window.__ModuleLoader__.load({
           ),
         ),
         open
-          ? h('div', { className: 'dsp-settings', role: 'dialog', 'aria-label': '外观设置 / Appearance' },
-              h('div', { className: 'dsp-settings-title' }, '外观 / Appearance'),
+          ? h('div', { className: 'dsp-settings', role: 'dialog', 'aria-label': '插件设置 / Settings' },
+              h('div', { className: 'dsp-settings-title' }, '设置 / Settings'),
               h('div', { className: 'dsp-settings-label' }, '主色 / Accent'),
               h(ThemeDots),
               h('div', { className: 'dsp-settings-label' }, `字号 / Size · ${fontSize}px`),
@@ -856,6 +951,11 @@ window.__ModuleLoader__.load({
                 value: fontSize, 'aria-label': '字号',
                 onChange: (event) => fontStore.set(Number(event.target.value)),
               }),
+              h('label', { className: 'dsp-settings-check' },
+                h('input', { type: 'checkbox', checked: thinkingEffects,
+                  onChange: event => thinkingEffectsStore.set(event.target.checked) }),
+                h('span', null, '分析气泡与波浪 / Analysis effects'),
+              ),
               h('div', { className: 'dsp-settings-label' }, '标签顺序 / Tab order'),
               h('button', {
                 className: 'dsp-btn', type: 'button',
@@ -863,8 +963,74 @@ window.__ModuleLoader__.load({
                 onClick: () => tabOrderStore.set(DEFAULT_TAB_ORDER),
                 title: '恢复溯源、结论、假设、摘录的默认顺序 / Restore default tab order',
               }, '恢复默认 / Reset'),
+              h('div', { className: 'dsp-settings-label' }, '回收站 / Recycle bin'),
+              h('div', { className: 'dsp-retention-policy' },
+                h('span', null, `上限 ${TRASH_MAX_ITEMS} 条 / Max ${TRASH_MAX_ITEMS} items`),
+                h('span', null, `超过 ${TRASH_RETENTION_DAYS} 天清理 / Expire after ${TRASH_RETENTION_DAYS} days`),
+                h('small', null, '所有会话共用；超限先清理最早移入的内容。 / Shared across chats; oldest deleted first.'),
+              ),
             )
           : null,
+      )
+    }
+
+    function TraceTools({ en, filter, onFilter, timeline, onJump, assumptions, assumptionsSaved, onSaveAssumptions }) {
+      const t = (zh, english) => en ? english : zh
+      const [open, setOpen] = React.useState(null)
+      const [pinned, setPinned] = React.useState(null)
+      const panelId = React.useId()
+      const filters = [['all', '全部', 'All'], ['user', '你的原话', 'Yours'], ['assistant', '结论', 'Conclusions'], ['tool', '外部', 'External']]
+      const activeFilter = filters.find(([value]) => value === filter) || filters[0]
+      const tools = [
+        { id: 'filter', label: `${t('筛选', 'Filter')} · ${t(activeFilter[1], activeFilter[2])}`, title: t('筛选依据来源', 'Filter evidence sources') },
+        { id: 'chain', label: `${t('思路链', 'Trace chain')} · ${timeline.length}`, title: t('查看思路链', 'View trace chain'), disabled: timeline.length < 2 },
+        { id: 'assumptions', label: `${t('依赖假设', 'Assumptions')} · ${assumptions.length}`, title: t('这条结论依赖的假设', 'Assumptions behind this conclusion'), disabled: !assumptions.length },
+      ]
+      const expanded = tools.find(tool => tool.id === open && !tool.disabled)
+      return h('div', { className: 'dsp-analysis-tools',
+        onMouseLeave: () => setOpen(pinned),
+        onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(pinned) },
+        onKeyDown: event => {
+          if (event.key !== 'Escape') return
+          event.preventDefault(); event.stopPropagation(); setOpen(null); setPinned(null)
+        },
+      },
+        h('div', { className: 'dsp-analysis-tabs', role: 'group', 'aria-label': t('溯源工具', 'Trace tools') },
+          ...tools.map(tool => h('button', { key: tool.id, type: 'button',
+            className: 'dsp-chip dsp-analysis-toggle', 'data-dsp-tool': tool.id, disabled: tool.disabled,
+            'aria-expanded': open === tool.id, 'aria-controls': panelId, title: tool.title,
+            onMouseEnter: () => { if (!tool.disabled) setOpen(tool.id) },
+            onFocus: () => setOpen(tool.id),
+            onClick: () => {
+              const next = pinned === tool.id ? null : tool.id
+              setPinned(next); setOpen(next)
+            },
+            onKeyDown: event => {
+              if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+              event.preventDefault()
+              const buttons = [...event.currentTarget.parentElement.querySelectorAll('button:not(:disabled)')]
+              const index = buttons.indexOf(event.currentTarget)
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+                : (index + (event.key === 'ArrowRight' ? 1 : -1) + buttons.length) % buttons.length
+              buttons[next]?.focus()
+            },
+          }, h('span', { className: 'dsp-analysis-label' }, tool.label),
+            h('span', { className: 'dsp-analysis-caret', 'aria-hidden': true }, open === tool.id ? '▴' : '▾'))),
+        ),
+        expanded ? h('div', { className: 'dsp-analysis-content', id: panelId, role: 'region', 'aria-label': expanded.title },
+          open === 'filter' ? h('div', { className: 'dsp-filters' }, ...filters.map(([value, zh, english]) =>
+            h('button', { key: value, type: 'button', className: 'dsp-chip' + (filter === value ? ' active' : ''),
+              'aria-pressed': filter === value, onClick: () => onFilter(value) }, t(zh, english))))
+          : open === 'chain' ? h('div', { className: 'dsp-timeline' }, ...timeline.map(node =>
+            h('button', { key: node.seq, type: 'button', className: 'dsp-node' + (node.role === 'claim' ? ' claim' : ''),
+              title: node.quote, onClick: () => onJump(node) },
+              h('span', { className: 'dsp-node-role' }, (node.role === 'claim' ? t('本结论', 'This claim') : roleLabel(node.role, t)) + (node.turn ? ` · ${node.turn}` : '')),
+              h('span', { className: 'dsp-node-quote' }, String(node.quote || '').slice(0, 40)))))
+          : h('div', { className: 'dsp-tool-assumptions' },
+              ...assumptions.map((text, index) => h('div', { key: index, className: 'dsp-asm' }, `· ${text}`)),
+              h('button', { className: 'dsp-btn', type: 'button', style: { alignSelf: 'flex-start' },
+                disabled: assumptionsSaved, onClick: onSaveAssumptions }, assumptionsSaved ? t('假设已存入台账', 'Assumptions saved') : t('只存假设', 'Save assumptions only'))),
+        ) : null,
       )
     }
 
@@ -916,11 +1082,17 @@ window.__ModuleLoader__.load({
     `
 
     const READING_STYLES = `
-      .dsp-quote-wrap { min-width: 0; }
+      .dsp-quote-wrap, .dsp-record-preview, .dpl-asm-text { min-width: 0; }
+      .dsp-record-text { line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .dsp-record-text.clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+      .dsp-record-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+      .dsp-record-row > :first-child:not(.dsp-record-toggle) { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+      .dsp-record-row > .dsp-record-toggle { flex-shrink: 0; margin-top: 0; }
+      .dsp-record-preview > .dpl-claim { margin-bottom: 0; }
       .dsp-ev-quote { line-height: 1.65; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
       .dsp-ev-quote.clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
       .dsp-ev-quote.expanded { white-space: pre-wrap; }
-      .dsp-quote-toggle { display: block; margin-top: 5px; padding: 1px 0; border: 0; background: transparent; color: var(--dsp-accent, #4f8cff); font: inherit; font-size: .85em; cursor: pointer; border-radius: 3px; }
+      .dsp-quote-toggle { display: block; margin-top: 5px; padding: 1px 0; margin-left: auto; text-align: right; border: 0; background: transparent; color: var(--dsp-accent, #4f8cff); font: inherit; font-size: .85em; cursor: pointer; border-radius: 3px; }
       .dsp-quote-toggle:is(:hover,:focus-visible) { text-decoration: underline; text-underline-offset: 3px; }
       .dsp-ev .dsp-ev-head { margin-bottom: 7px; gap: 8px; }
       .dsp-ev .dsp-ev-why { border-top: 1px solid var(--dsw-alias-border-l1); margin-top: 9px; padding-top: 7px; line-height: 1.55; font-size: .88em; }
@@ -930,7 +1102,7 @@ window.__ModuleLoader__.load({
       .dsp-source-actions, .dsp-reading-return { position: fixed; z-index: 74; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); box-shadow: 0 5px 20px #0003; font-size: var(--dsp-fs,13px); border-radius: 10px; }
       .dsp-source-actions { display: flex; flex-wrap: wrap; gap: 3px; padding: 4px; max-width: calc(100vw - 16px); animation: dsp-source-in 150ms ease-out; }
       .dsp-source-actions button { white-space: nowrap; font: inherit; border: 0; border-radius: 6px; padding: 6px 8px; background: transparent; color: var(--dsw-alias-label-primary); cursor: pointer; transition: color 150ms, background 150ms; }
-      .dsp-source-actions .dsp-source-insert { color: var(--dsp-accent, #4f8cff); }
+      .dsp-source-actions .dsp-source-followup { color: var(--dsp-accent, #4f8cff); }
       .dsp-source-actions button:is(:hover,:focus-visible), .dsp-reading-return:is(:hover,:focus-visible) { background: var(--dsp-accent-soft); color: var(--dsp-accent, #4f8cff); outline: 1px solid var(--dsp-accent, #4f8cff); }
       .dsp-insert-error { flex-basis: 100%; max-width: 290px; padding: 4px 8px; font-size: .9em; color: var(--dsw-alias-label-secondary); }
       .dsp-reading-return { right: 20px; bottom: 144px; padding: 8px 12px; cursor: pointer; font-family: inherit; }
@@ -1050,7 +1222,7 @@ window.__ModuleLoader__.load({
       }
       .dsp-card.dsp-closing { animation: dsp-panel-exit 280ms cubic-bezier(.4,0,.8,1) both; pointer-events: none; }
       .dsp-card :is(button, [role="button"]):focus-visible { outline: 2px solid var(--dsp-accent, #4f8cff); outline-offset: 3px; }
-      .dsp-card :is(.dsp-head, .dsp-body, .dsp-foot) { box-sizing: border-box; }
+      .dsp-card :is(.dsp-head, .dsp-body, .dsp-foot, .dsp-tabbar) { box-sizing: border-box; }
       .dsp-coverage { font-size: 11px; line-height: 1.6; padding: 9px 11px; border-radius: 10px; color: var(--dsw-alias-label-secondary); background: var(--dsp-accent-soft, #eef4ff); }
       .dsp-body > * { flex-shrink: 0; }
       .dsp-body { overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--dsw-alias-border-l2) transparent; }
@@ -1067,8 +1239,6 @@ window.__ModuleLoader__.load({
       }
       .dsp-resize:hover { border-color: var(--dsp-accent, var(--dsw-alias-brand-primary)); }
       .dsp-timeline { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 6px; overflow: visible; }
-      .dsp-timeline-block { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
-      .dsp-timeline-toggle { color: var(--dsw-alias-label-secondary); }
       .dsp-node {
         flex: 0 0 auto; max-width: 156px; border: 1px solid var(--dsw-alias-border-l1);
         border-radius: 9px; padding: 4px 7px; background: var(--dsw-alias-bg-base);
@@ -1095,11 +1265,17 @@ window.__ModuleLoader__.load({
         box-shadow: 0 0 0 1px color-mix(in srgb, var(--dsw-alias-state-error-primary) 9%, transparent);
       }
       .dsp-ev.flagged { opacity: 0.62; border-style: dashed; }
-      .dsp-assumptions { border: 1px dashed var(--dsw-alias-border-l2); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
-      .dsp-assumptions:not(.open) { border-color: transparent; padding: 2px 0; }
-      .dsp-assumptions-head { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.92); font-weight: 600; cursor: pointer; padding: 0; display: flex; align-items: center; gap: 6px; text-align: left; }
-      .dsp-assumptions-head:is(:hover, :focus-visible) { color: var(--dsp-hover-text); }
-      .dsp-assumptions-caret { font-size: calc(var(--dsp-fs, 13px) * 0.77); }
+      .dsp-analysis-tools { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+      .dsp-analysis-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+      .dsp-analysis-tabs .dsp-analysis-toggle { display: flex; align-items: center; justify-content: center; gap: 3px; min-width: 0; max-width: 100%; padding: 4px 6px; white-space: nowrap; }
+      .dsp-analysis-toggle:first-child { justify-content: flex-start; }
+      .dsp-analysis-toggle:last-child { justify-content: flex-end; }
+      .dsp-analysis-label { overflow: hidden; text-overflow: ellipsis; }
+      .dsp-analysis-caret { flex-shrink: 0; font-size: .85em; }
+      .dsp-analysis-toggle[aria-expanded="true"] { color: var(--dsp-accent, #4f8cff); border-color: var(--dsp-accent, #4f8cff); background: var(--dsp-accent-soft); }
+      .dsp-analysis-toggle:disabled { opacity: .45; cursor: default; }
+      .dsp-analysis-content { min-width: 0; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; padding: 8px; }
+      .dsp-tool-assumptions { display: flex; flex-direction: column; gap: 7px; }
       .dsp-asm { font-size: calc(var(--dsp-fs, 13px) * 0.92); color: var(--dsw-alias-label-primary); }
       .dsp-head { display: flex; align-items: center; gap: 8px; padding: 13px 15px; background: transparent; border-bottom: 1px solid var(--dsw-alias-border-l1); }
       .dsp-title { font-weight: 600; font-size: var(--dsp-fs, 13px); color: var(--dsp-accent, inherit); }
@@ -1124,6 +1300,10 @@ window.__ModuleLoader__.load({
       }
       .dsp-settings-title { font-size: calc(var(--dsp-fs, 13px) * 0.92); font-weight: 600; }
       .dsp-settings-label { font-size: calc(var(--dsp-fs, 13px) * 0.85); color: var(--dsw-alias-label-secondary); }
+      .dsp-settings-check { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 2px; text-align: left; cursor: pointer; font-size: calc(var(--dsp-fs, 13px) * 0.85); }
+      .dsp-settings-check input { appearance: auto; flex: 0 0 auto; width: 14px; height: 14px; margin: 0; accent-color: var(--dsp-accent, #4f8cff); cursor: pointer; }
+      .dsp-retention-policy { width: 100%; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; padding: 7px; text-align: left; font-size: calc(var(--dsp-fs, 13px) * .85); }
+      .dsp-retention-policy small { color: var(--dsw-alias-label-secondary); line-height: 1.5; }
       .dsp-slider {
         width: 100%; height: 16px; cursor: pointer;
         accent-color: var(--dsp-accent, #4f8cff);
@@ -1134,8 +1314,11 @@ window.__ModuleLoader__.load({
       .dsp-body { padding: 12px 12px 18px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; }
       .dsp-head, .dsp-foot { flex: 0 0 auto; }
       .dsp-claim { border-left: 3px solid var(--dsp-accent, var(--dsw-alias-brand-primary)); padding: 2px 0 2px 10px; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
-      .dsp-claim-actions { display: flex; gap: 6px; margin-top: -6px; }
-      .dsp-tabbar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding-bottom: 6px; }
+      .dsp-claim-text { line-height: 1.65; white-space: pre-wrap; }
+      .dsp-claim-text.clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+      .dsp-claim-preview .dsp-claim-toggle { margin-top: 5px; }
+      .dsp-claim-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin-top: -6px; }
+      .dsp-tabbar { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding: 10px 12px 9px; }
       .dsp-tabs { position: relative; display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
       .dsp-tabs.sorting .dsp-tab { cursor: grabbing; }
       .dsp-tab-ghost { position: absolute; z-index: 2; transform: translate(8px, -50%); pointer-events: none; white-space: nowrap; border: 1px solid var(--dsp-accent, #4f8cff); border-radius: 999px; padding: 3px 8px; color: var(--dsp-hover-text); background: var(--dsw-alias-bg-layer-1); box-shadow: 0 4px 12px rgba(0,0,0,.16); font-size: calc(var(--dsp-fs, 13px) * .92); }
@@ -1188,8 +1371,6 @@ window.__ModuleLoader__.load({
       .dsp-ev-why { color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.92); margin-top: 4px; }
       .dsp-unsupported { color: var(--dsw-alias-state-warn-primary); font-size: calc(var(--dsp-fs, 13px) * 0.92); }
       .dsp-filters { display: flex; gap: 6px; flex-wrap: wrap; }
-      .dsp-filterbar { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
-      .dsp-filter-toggle { color: var(--dsw-alias-label-secondary); }
       .dsp-chip { border: 1px solid var(--dsw-alias-border-l1); background: transparent; color: var(--dsw-alias-label-secondary); border-radius: 999px; padding: 2px 8px; font-size: calc(var(--dsp-fs, 13px) * 0.85); cursor: pointer; }
       .dsp-chip:is(:hover, :focus-visible) { border-color: var(--dsp-hover-border); color: var(--dsp-hover-text); background: var(--dsp-accent-soft, transparent); box-shadow: 0 0 0 1px var(--dsp-hover-ring); }
       .dsp-chip.active { color: var(--dsp-accent, var(--dsw-alias-brand-primary)); border-color: var(--dsp-accent, var(--dsw-alias-brand-primary)); background: var(--dsp-accent-soft, transparent); }
@@ -1198,6 +1379,8 @@ window.__ModuleLoader__.load({
       .dsp-foot-top { display: flex; align-items: center; gap: 8px; width: 100%; }
       .dsp-foot-aux { display: flex; flex-wrap: wrap; gap: 4px; }
       .dsp-foot-aux:empty { display: none; }
+      .dsp-foot-divider { display: none; flex: 0 0 1px; height: 18px; background: var(--dsw-alias-border-l2); }
+      .dsp-foot-aux:not(:empty) + .dsp-foot-divider { display: block; }
       .dsp-foot-top .dsp-search-dock { flex: 1; min-width: 0; min-height: 32px; padding: 0; border-top: 0; font-size: var(--dsp-fs, 13px); }
       .dsp-foot-top .dsp-search-form { inset: 0; }
       .dsp-foot-top .dsp-search-peek { min-height: 32px; }
@@ -1212,7 +1395,7 @@ window.__ModuleLoader__.load({
       .dsp-btn.active { border-color: var(--dsp-accent, var(--dsw-alias-border-l2)); color: var(--dsp-accent, var(--dsw-alias-label-primary)); background: var(--dsp-accent-soft, transparent); }
       .dsp-btn.active:not(:disabled):is(:hover, :focus-visible), .dsp-chip.active:is(:hover, :focus-visible), .dsp-tab.active:is(:hover, :focus-visible) { color: var(--dsp-hover-border); }
       .dsp-btn:disabled { opacity: .55; cursor: default; }
-      .dsp-card :is(.dsp-btn, .dsp-tab-export, .dsp-tab, .dsp-chip, .dsp-node, .dsp-flag, .dsp-assumptions-head),
+      .dsp-card :is(.dsp-btn, .dsp-tab-export, .dsp-tab, .dsp-chip, .dsp-node, .dsp-flag),
       .dsp-ev :is(.dsp-ev-head, .dsp-ev-quote, .dsp-ev-why) {
         transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease, filter 160ms ease;
       }
@@ -1223,6 +1406,7 @@ window.__ModuleLoader__.load({
       .dsp-extra-title { font-size: calc(var(--dsp-fs, 13px) * 0.92); font-weight: 600; color: var(--dsw-alias-label-secondary); }
       .dsp-hint {
         position: fixed; top: 16px; left: 50%; transform: translateX(-50%) translateY(-6px); z-index: 71;
+        width: max-content; max-width: calc(100vw - 24px); box-sizing: border-box;
         background: linear-gradient(180deg, rgba(38, 78, 150, 0.97), rgba(23, 49, 99, 0.97));
         color: #e8f0ff;
         border: 1px solid rgba(126, 174, 255, 0.78); border-radius: 999px;
@@ -1319,8 +1503,23 @@ window.__ModuleLoader__.load({
       .dsp-pill-main:hover { color: #dbeaff; }
       .dsp-pill-x { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font-size: calc(var(--dsp-fs, 13px) * 1.08); line-height: 1; padding: 2px 6px; border-radius: 999px; }
       .dsp-pill-x:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
-      .dsp-spin { width: 12px; height: 12px; border: 2px solid var(--dsw-alias-border-l2); border-top-color: var(--dsw-alias-brand-primary); border-radius: 50%; animation: dsp-spin 0.8s linear infinite; display: inline-block; }
+      .dsp-card .dsp-spin { display: block; flex: 0 0 16px; width: 16px; height: 16px; min-width: 16px; min-height: 16px; box-sizing: border-box; border: 0; overflow: visible; animation: dsp-spin .9s linear infinite; }
+      .dsp-spin-track { stroke: var(--dsw-alias-border-l2); }
+      .dsp-spin-arc { stroke: var(--dsp-accent, #4f8cff); }
       @keyframes dsp-spin { to { transform: rotate(360deg); } }
+      /* An isolated negative layer keeps the activity behind every control and text. */
+      .dsp-card { isolation: isolate; }
+      .dsp-thinking { position: absolute; inset: 50% 0 0; z-index: -1; overflow: hidden; pointer-events: none; opacity: 0; background: linear-gradient(0deg, rgba(75,151,255,.1), rgba(75,151,255,.025) 60%, transparent); mask-image: linear-gradient(to top, #000 60%, transparent 100%); }
+      .dsp-thinking-wave { position: absolute; left: -100%; bottom: -12%; width: 200%; height: 54%; color: rgba(81,157,255,.11); transform: translateX(0); }
+      .dsp-thinking-wave.back { bottom: -5%; height: 63%; color: rgba(112,185,255,.075); }
+      .dsp-thinking.moving .dsp-thinking-wave { animation: dsp-thinking-drift 17s linear infinite; }
+      .dsp-thinking.moving .dsp-thinking-wave.back { animation-duration: 23s; }
+      .dsp-thinking-bubble { position: absolute; left: var(--bubble-x); bottom: 0; height: 100%; width: var(--bubble-size); opacity: 0; }
+      .dsp-thinking-bubble::after { content: ''; position: absolute; bottom: 0; left: 0; width: var(--bubble-size); height: var(--bubble-size); box-sizing: border-box; border: 1px solid rgba(131,198,255,.34); border-radius: 50%; background: radial-gradient(circle at 30% 25%, rgba(187,225,255,.25), rgba(80,158,255,.12) 65%); }
+      .dsp-thinking.moving .dsp-thinking-bubble { animation: dsp-thinking-rise var(--bubble-duration) linear infinite; animation-delay: var(--bubble-delay); }
+      @keyframes dsp-thinking-drift { to { transform: translateX(50%); } }
+      @keyframes dsp-thinking-rise { 0% { opacity: 0; transform: translate3d(0,12px,0); } 16% { opacity: .85; } 65% { opacity: .7; } 100% { opacity: 0; transform: translate3d(var(--bubble-drift),-100%,0); } }
+      @media (prefers-reduced-motion: reduce) { .dsp-thinking { display: none; } }
       @media (prefers-reduced-motion: reduce) {
         .dsp-frame, .dsp-hint, .dsp-hint::before, .dsp-hint::after, .dsp-trigger::before, .dsp-trigger::after { animation: none; }
       }
@@ -1855,7 +2054,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function insertSourceDraft(ctx, source, en) {
+    function prepareSourceFollowup(ctx, source, en) {
       if (!source?.quote?.trim() || source.sessionId !== sessionStore.id) return false
       try {
         const binding = ctx.get('sessions')?.binding?.(source.sessionId)
@@ -1866,7 +2065,7 @@ window.__ModuleLoader__.load({
         if (!actions?.captureInsertion || !actions?.insertText || ['adjudicating', 'submitting'].includes(state?.phase)) return false
         const caret = actions.captureInsertion()
         if (!Number.isFinite(caret?.end) || caret.draftRev == null) return false
-        const text = `\n\n${en ? 'About this passage:' : '关于这段原文：'}\n> ${source.quote.trim().replace(/\r\n?/g, '\n').replace(/\n/g, '\n> ')}\n\n`
+        const text = `\n\n${en ? 'Please answer my follow-up based on this passage:' : '请基于以下原文回答我的追问：'}\n> ${source.quote.trim().replace(/\r\n?/g, '\n').replace(/\n/g, '\n> ')}\n\n${en ? 'My follow-up: ' : '我的追问：'}`
         // Collapse at the caret's end so even a selected draft is preserved.
         const inserted = actions.insertText(text, { ...caret, start: caret.end, end: caret.end })
         if (inserted !== true) return false
@@ -1930,15 +2129,16 @@ window.__ModuleLoader__.load({
           onPointerLeave: () => { inside.current = false; hideTimer.current = setTimeout(() => setPosition(null), 220) },
           onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) setPosition(null) },
         },
-          h('button', { type: 'button', className: 'dsp-source-insert', onClick: () => {
-            if (insertSourceDraft(ctx, reading.source, en)) {
+          h('button', { type: 'button', className: 'dsp-source-followup',
+            title: t('引用这段原文，并在输入框里继续提问', 'Quote this passage and continue asking in the composer'), onClick: () => {
+            if (prepareSourceFollowup(ctx, reading.source, en)) {
               setPosition(null)
-              onNotice(t('原文已加入输入框，可编辑后继续追问', 'Passage added to the draft. Edit it and ask a follow-up.'))
+              onNotice(t('已准备原文追问，直接在输入框里写问题即可', 'Ready to follow up on this passage. Type your question in the composer.'))
             } else {
               const message = t('暂时无法插入，请检查输入框是否可编辑。原文仍保留选中。', 'Could not insert. Check that the composer is editable. The source remains selected.')
               setInsertError(message); onNotice(message)
             }
-          } }, t('＋ 添加原文到输入框', '+ Add passage to draft')),
+          } }, t('追问', 'Follow up')),
           reading.history.length ? h('button', { type: 'button', disabled: reading.returning, onClick: onReturn }, t('↶ 返回', '↶ Back')) : null,
           insertError ? h('span', { className: 'dsp-insert-error', role: 'status' }, insertError) : null,
         ) : null,
@@ -2267,16 +2467,24 @@ window.__ModuleLoader__.load({
         const [archiveNotice, setArchiveNotice] = React.useState('')
 
         React.useEffect(() => {
-          const focus = ledgerFocus.value
-          if (!focus) return
-          ledgerFocus.value = null
-          if (String(focus).startsWith('decision:')) {
-            setSection('decisions')
-            setExpanded(String(focus).slice('decision:'.length))
-          } else if (focus === 'section:assumptions' || focus === 'section:trash') {
-            setSection(String(focus).slice('section:'.length))
+          const applyFocus = () => {
+            if (ledgerFocus.sessionId !== sessionId) return
+            const focus = ledgerFocus.value
+            if (!focus) return
+            ledgerFocus.value = null
+            setScope('session')
+            setQuery('')
+            if (String(focus).startsWith('decision:')) {
+              setSection('decisions')
+              setExpanded(String(focus).slice('decision:'.length))
+            } else if (focus === 'section:assumptions' || focus === 'section:trash') {
+              setSection(String(focus).slice('section:'.length))
+            }
           }
-        }, [])
+          applyFocus()
+          window.addEventListener(LEDGER_FOCUS_EVENT, applyFocus)
+          return () => window.removeEventListener(LEDGER_FOCUS_EVENT, applyFocus)
+        }, [sessionId])
 
         React.useEffect(() => {
           const request = props.viewRequest
@@ -2494,16 +2702,15 @@ window.__ModuleLoader__.load({
             key: decision.id,
             className: 'dpl-card' + (decision.status === 'revoked' ? ' revoked' : ''),
           },
-            h('div', { className: 'dpl-claim' }, decision.claim),
-            h('div', { className: 'dpl-meta' },
-              h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
-              h('span', null, `${evidenceCount} ${t('条依据', 'sources')}`),
-              decision.status === 'revoked' ? h('span', null, t('已撤销', 'revoked')) : null,
-            ),
+            h(CollapsibleText, { text: decision.claim, en, variant: 'record', className: 'dpl-claim',
+              metadata: h('div', { className: 'dpl-meta' },
+                h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
+                h('span', null, `${evidenceCount} ${t('条依据', 'sources')}`),
+                decision.status === 'revoked' ? h('span', null, t('已撤销', 'revoked')) : null,
+              ),
+            }),
             (decision.assumptions || []).length > 0
-              ? h('div', { className: 'dpl-asms' },
-                  ...decision.assumptions.map((text, index) =>
-                    h('span', { key: index, className: 'dpl-asm' }, text)))
+              ? h(CollapsibleText, { text: decision.assumptions.join('\n'), en, variant: 'record', className: 'dpl-asm-src' })
               : null,
             h('div', { className: 'dpl-actions' },
               h('button', {
@@ -2528,10 +2735,9 @@ window.__ModuleLoader__.load({
 
         const renderAssumption = (item) => h('div', { key: item.id, className: 'dpl-asm-row' },
           h('div', { className: 'dpl-asm-text' },
-            h('div', null, item.text),
+            h(CollapsibleText, { text: item.text, en, variant: 'record' }),
             item.sourceClaim
-              ? h('div', { className: 'dpl-asm-src' },
-                  t('来自：', 'From: ') + String(item.sourceClaim).slice(0, 80))
+              ? h(CollapsibleText, { text: t('来自：', 'From: ') + item.sourceClaim, en, variant: 'record', className: 'dpl-asm-src' })
               : null,
           ),
           h('div', { className: 'dpl-actions', style: { marginTop: 0 } },
@@ -2552,10 +2758,11 @@ window.__ModuleLoader__.load({
         const removeNote = id => setArchiveNotice(recycleNotice(recycleLedgerItem('notes', id), t))
 
         const renderNote = (note) => h('div', { key: note.id, className: 'dpl-card' },
-          h('div', { className: 'dpl-note' }, note.text),
-          h('div', { className: 'dpl-meta' },
-            h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
-          ),
+          h(CollapsibleText, { text: note.text, en, variant: 'record', className: 'dpl-note',
+            metadata: h('div', { className: 'dpl-meta' },
+              h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
+            ),
+          }),
           h('div', { className: 'dpl-actions' },
             h('button', {
               className: 'dpl-btn',
@@ -2641,6 +2848,26 @@ window.__ModuleLoader__.load({
         }
       }, [active])
       return h('span', { className: className + (running ? ' moving' : ''), ref: surfaceRef, 'aria-hidden': 'true' }, children)
+    }
+
+    function LoadingSpinner() {
+      return h('svg', { className: 'dsp-spin', width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+        h('circle', { className: 'dsp-spin-track', cx: 8, cy: 8, r: 6, strokeWidth: 2 }),
+        h('circle', { className: 'dsp-spin-arc', cx: 8, cy: 8, r: 6, strokeWidth: 2, strokeLinecap: 'round', strokeDasharray: '11 27' }),
+      )
+    }
+
+    function AnalysisAtmosphere({ active }) {
+      const wave = 'M0 120 C200 75 400 75 600 120 S1000 165 1200 120 C1400 75 1600 75 1800 120 S2200 165 2400 120 V240 H0Z'
+      return h(MotionSurface, { active, className: 'dsp-thinking' },
+        ...['back', 'front'].map(layer => h('svg', { key: layer, className: `dsp-thinking-wave ${layer}`, viewBox: '0 0 2400 240', preserveAspectRatio: 'none', focusable: 'false' },
+          h('path', { d: wave, fill: 'currentColor' }))),
+        ...[9, 24, 39, 54, 69, 84, 17, 46, 76].map((left, index) => h('span', { key: left, className: 'dsp-thinking-bubble', style: {
+          '--bubble-x': `${left}%`, '--bubble-size': `${4 + index % 4 * 1.5}px`,
+          '--bubble-duration': `${6.5 + index % 4 * .8}s`, '--bubble-delay': `${-index * 1.1}s`,
+          '--bubble-drift': `${index % 2 ? 12 : -9}px`,
+        } })),
+      )
     }
 
     /** Use the resident viewport, not a slot wrapper (which may be display:contents). */
@@ -2861,6 +3088,7 @@ window.__ModuleLoader__.load({
         const fontSize = useFontSize()
 
         const [mode, setMode] = React.useState('idle')
+        const thinkingEffects = useThinkingEffects()
         const [panelTab, setPanelTab] = React.useState('trace')
         const [traceScope, setTraceScope] = React.useState('session')
         const [relatedSelection, setRelatedSelection] = React.useState(null)
@@ -2887,9 +3115,6 @@ window.__ModuleLoader__.load({
         const [original, setOriginal] = React.useState(null)
         const [extra, setExtra] = React.useState(null)
         const [filter, setFilter] = React.useState('all')
-        const [filtersOpen, setFiltersOpen] = React.useState(false)
-        const [timelineOpen, setTimelineOpen] = React.useState(false)
-        const [assumptionsOpen, setAssumptionsOpen] = React.useState(false)
         const [elapsed, setElapsed] = React.useState(0)
         const [chatRect, setChatRect] = React.useState(null)
         const [chatHost, setChatHost] = React.useState(null)
@@ -2903,6 +3128,7 @@ window.__ModuleLoader__.load({
         const [notice, setNotice] = React.useState('')
         const reading = useReading()
         const abortRef = React.useRef(null)
+        const corroborateAbortRef = React.useRef(null)
         const jumpAbortRef = React.useRef(null)
         const selectionRef = React.useRef({})
         const bodyRef = React.useRef(null)
@@ -2917,6 +3143,7 @@ window.__ModuleLoader__.load({
 
         const stopTracing = React.useCallback(() => {
           pendingCrossJump.value = null
+          corroborateAbortRef.current?.abort()
           readingStore.clear()
           relatedAbortRef.current?.abort()
           relationsAbortRef.current?.abort()
@@ -2951,9 +3178,6 @@ window.__ModuleLoader__.load({
           setRecycleStatus('')
           setNotice('')
           setFilter('all')
-          setFiltersOpen(false)
-          setTimelineOpen(false)
-          setAssumptionsOpen(false)
           setCopied(false)
           clearHighlights()
         }, [])
@@ -2961,6 +3185,7 @@ window.__ModuleLoader__.load({
         const runTrace = React.useCallback(
           async (quote, raw, identity) => {
             setShowTrash(false)
+            corroborateAbortRef.current?.abort()
             readingStore.generation++
             readingStore.set({ source: null, returning: false, travel: null })
             readingStore.lastSelection = selectedPassage()
@@ -2986,9 +3211,6 @@ window.__ModuleLoader__.load({
             setOriginal(null)
             setExtra(null)
             setFilter('all')
-            setFiltersOpen(false)
-            setTimelineOpen(false)
-            setAssumptionsOpen(false)
             setCopied(false)
             setPinnedId(null)
             setAssumptionsSaved(false)
@@ -3028,6 +3250,8 @@ window.__ModuleLoader__.load({
               setError(cause instanceof Error ? cause.message : String(cause))
               setErrorHint(cause?.hint || t('请重新分析；如果仍然失败，请确认 DSH 已加载最新插件并检查当前模型服务。', 'Analyze again. If it still fails, check that DSH has loaded the latest plugin and the model service is available.'))
               setMode('error')
+            } finally {
+              if (abortRef.current === controller) abortRef.current = null
             }
           },
           [sessionId, en],
@@ -3035,6 +3259,7 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           selectionRef.current = {}
+          corroborateAbortRef.current?.abort()
           abortRef.current?.abort()
           jumpAbortRef.current?.abort()
           if (previousSessionRef.current !== sessionId) {
@@ -3056,23 +3281,49 @@ window.__ModuleLoader__.load({
           }
         }, [sessionId])
 
+        const cancelAnalysis = () => {
+          abortRef.current?.abort()
+          abortRef.current = null
+          corroborateAbortRef.current?.abort()
+          relationsAbortRef.current?.abort()
+          if (extra?.status === 'loading') setExtra(null)
+          if (relations.status === 'loading') setRelations({ status: 'idle', items: [] })
+          if (modeRef.current === 'loading') {
+            relatedAbortRef.current?.abort()
+            setRelatedSelection(null)
+            setRelated({ status: 'idle', hits: [] })
+            setTraceScope('session')
+            setMode('armed')
+            setResult(null)
+            setError(null)
+            setErrorHint('')
+            setElapsed(0)
+            clearHighlights()
+          }
+          setNotice(t('已取消分析，可以重新选择文字。', 'Analysis cancelled. You can select another passage.'))
+        }
+
         const runCorroborate = React.useCallback(async () => {
           if (!claim) return
+          corroborateAbortRef.current?.abort()
+          const controller = new AbortController()
+          corroborateAbortRef.current = controller
           setExtra({ status: 'loading' })
           try {
             const response = await fetch(CORROBORATE_ROUTE, {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ quote: claim }),
+              method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ quote: claim }), signal: controller.signal,
             })
             const data = await response.json().catch(() => null)
+            if (controller.signal.aborted) return
             if (!data || data.ok !== true) {
               throw new Error((en ? data?.messageEn || data?.message : data?.message) || data?.error || t('检索失败', 'Search failed'))
             }
             setExtra({ status: 'done', sources: data.sources || [] })
           } catch (cause) {
-            setExtra({ status: 'error', error: cause instanceof Error ? cause.message : String(cause) })
+            if (!controller.signal.aborted) setExtra({ status: 'error', error: cause instanceof Error ? cause.message : String(cause) })
+          } finally {
+            if (corroborateAbortRef.current === controller) corroborateAbortRef.current = null
           }
         }, [claim, en])
 
@@ -3204,14 +3455,10 @@ window.__ModuleLoader__.load({
                 if (++attempts < 120) window.setTimeout(tryFocus, 150)
                 return
               }
-              // Whether a session switch has finished loading is not under
-              // our control, so "is the chat flow mounted" has to be polled
-              // on every attempt rather than guessed with one or two
-              // fixed-delay checks that can land before the switch is done.
-              if (!document.querySelector('[data-slot="conversation.chat.flow"]')) {
-                openChat(ctx, jumpSession)
-                clickChatTab()
-              }
+              // A cached transcript can stay mounted behind Archive. Select
+              // Chat explicitly before locating, even when that DOM exists.
+              openChat(ctx, jumpSession)
+              clickChatTab()
               if (focusQuote(quote, [])) {
                 setNotice(t('已定位到原文', 'Located'))
                 window.setTimeout(() => setNotice(''), 1800)
@@ -3495,9 +3742,6 @@ window.__ModuleLoader__.load({
             setOriginal(null)
             setExtra(null)
             setFilter('all')
-            setFiltersOpen(false)
-            setTimelineOpen(false)
-            setAssumptionsOpen(false)
             setCopied(false)
             setPinnedId(null)
             setAssumptionsSaved(false)
@@ -3511,6 +3755,7 @@ window.__ModuleLoader__.load({
             if (event.isComposing) return
             if (event.key === 'Escape') {
               if (event.target?.closest?.('.dsp-search-dock')) return
+              if (event.target?.closest?.('.dsp-analysis-tools')?.querySelector('[aria-expanded="true"]')) return
               // Let the settings popover consume Escape without exiting the mode.
               if (document.querySelector('.dsp-settings')) return
               stopTracing()
@@ -3589,21 +3834,27 @@ window.__ModuleLoader__.load({
           // it through window resizes and sidebar toggles.
           let last = ''
           let lastHost = null
+          let observer = null
           const update = () => {
             const region = conversationFrameRegion(sessionId)
             if (!region) return
-            if (region.host !== lastHost) { lastHost = region.host; setChatHost(region.host) }
+            if (region.host !== lastHost) {
+              lastHost = region.host; setChatHost(region.host)
+              observer?.disconnect(); observer?.observe(region.host)
+            }
             const next = region.rect
             const key = `${next.left}:${next.top}:${next.width}:${next.height}`
             if (key === last) return
             last = key
             setChatRect(next)
           }
+          if (typeof ResizeObserver !== 'undefined') observer = new ResizeObserver(update)
           update()
           const timer = window.setInterval(update, 300)
           window.addEventListener('resize', update)
           window.addEventListener('scroll', update, true)
           return () => {
+            observer?.disconnect()
             window.clearInterval(timer)
             window.removeEventListener('resize', update)
             window.removeEventListener('scroll', update, true)
@@ -3628,6 +3879,7 @@ window.__ModuleLoader__.load({
           () => () => {
             relatedAbortRef.current?.abort()
             relationsAbortRef.current?.abort()
+            corroborateAbortRef.current?.abort()
             abortRef.current?.abort()
             jumpAbortRef.current?.abort()
             searchJumpAbortRef.current?.abort()
@@ -3641,6 +3893,7 @@ window.__ModuleLoader__.load({
           if (motionRef.current) return
           motionRef.current = true
           setClosing(true)
+          corroborateAbortRef.current?.abort()
           jumpAbortRef.current?.abort()
           searchJumpAbortRef.current?.abort()
           abortRef.current?.abort()
@@ -4020,7 +4273,8 @@ window.__ModuleLoader__.load({
         if (chromeVisible) {
           const armed = hintMode === 'armed'
           parts.push(
-            h('div', { className: 'dsp-hint' + (active ? ' visible' : ''), key: 'hint' },
+            h('div', { className: 'dsp-hint' + (active ? ' visible' : ''), key: 'hint',
+              style: chatRect ? { left: chatRect.left + chatRect.width / 2, maxWidth: Math.max(0, chatRect.width - 24) } : undefined },
               h('b', null, armed ? '⌘⌥T' : '⌕'),
               ' ',
               armed
@@ -4142,9 +4396,12 @@ window.__ModuleLoader__.load({
         )
 
         const body = []
+        const isAnalyzing = mode === 'loading' || extra?.status === 'loading' || relations.status === 'loading'
+        const cancelControl = h('button', { type: 'button', className: 'dsp-btn danger dsp-cancel-analysis', onClick: cancelAnalysis,
+          title: t('中断正在进行的分析请求', 'Stop the active analysis request') }, t('取消分析', 'Cancel analysis'))
 
         if (claim) {
-          body.push(h('div', { className: 'dsp-claim', key: 'claim' }, `「${claim}」`))
+          body.push(h(CollapsibleText, { text: claim, en, variant: 'claim', key: `claim-${claim}` }))
           body.push(
             h('div', { key: 'claim-actions', className: 'dsp-claim-actions' },
               h('button', {
@@ -4154,131 +4411,24 @@ window.__ModuleLoader__.load({
                 onClick: saveNote,
                 title: t('把选中的话存进「档案 → 摘录」', 'Save this passage to Archive → Notes'),
               }, noteSaved ? t('已存笔记', 'Note saved') : t('存为笔记', 'Save as note')),
+              isAnalyzing ? cancelControl : null,
             ),
           )
         }
 
         if (result) {
-          const filters = [
-            ['all', '全部', 'All'],
-            ['user', '你的原话', 'Yours'],
-            ['assistant', '结论', 'Conclusions'],
-            ['tool', '外部', 'External'],
-          ]
-          const active = filters.find(([value]) => value === filter) || filters[0]
-          body.push(
-            h('div', {
-              key: 'filters',
-              className: 'dsp-filterbar',
-              onMouseEnter: () => setFiltersOpen(true),
-              onMouseLeave: () => setFiltersOpen(false),
-            },
-              h('button', {
-                className: 'dsp-chip dsp-filter-toggle',
-                type: 'button',
-                'aria-expanded': filtersOpen ? 'true' : 'false',
-                title: t('展开 / 收起筛选', 'Toggle filters'),
-                onClick: () => setFiltersOpen((value) => !value),
-              }, `${t('筛选', 'Filter')} · ${t(active[1], active[2])} ${filtersOpen ? '▴' : '▾'}`),
-              filtersOpen
-                ? h('div', { className: 'dsp-filters' },
-                    ...filters.map(([value, zh, english]) =>
-                      h('button', {
-                        key: value,
-                        type: 'button',
-                        className: 'dsp-chip' + (filter === value ? ' active' : ''),
-                        onClick: () => setFilter(value),
-                      }, t(zh, english)),
-                    ),
-                  )
-                : null,
-            ),
-          )
-        }
-
-        if (result) {
-          const timeline = buildTimeline(result)
-          if (timeline.length > 1) {
-            const nodes = []
-            timeline.forEach((node) => {
-              nodes.push(
-                h('button', {
-                  key: `node-${node.seq}`,
-                  type: 'button',
-                  className: 'dsp-node' + (node.role === 'claim' ? ' claim' : ''),
-                  title: node.quote,
-                  onClick: () => void jumpTo({ seq: node.seq, quote: node.quote }, keywordsFor(result, node.seq)),
-                },
-                  h('span', { className: 'dsp-node-role' },
-                    (node.role === 'claim' ? t('本结论', 'This claim') : roleLabel(node.role, t))
-                    + (node.turn ? ` · ${node.turn}` : '')),
-                  h('span', { className: 'dsp-node-quote' }, String(node.quote || '').slice(0, 40)),
-                ),
-              )
-            })
-            body.push(
-              h('div', {
-                key: 'timeline',
-                className: 'dsp-timeline-block',
-                onMouseEnter: () => setTimelineOpen(true),
-                onMouseLeave: () => setTimelineOpen(false),
-              },
-                h('button', {
-                  className: 'dsp-chip dsp-timeline-toggle',
-                  type: 'button',
-                  'aria-expanded': timelineOpen ? 'true' : 'false',
-                  title: t('展开 / 收起思路链', 'Toggle trace chain'),
-                  onClick: () => setTimelineOpen((value) => !value),
-                }, `${t('思路链', 'Trace chain')} · ${timeline.length} ${timelineOpen ? '▴' : '▾'}`),
-                timelineOpen
-                  ? h('div', { className: 'dsp-timeline' }, ...nodes)
-                  : null,
-              ),
-            )
-          }
-        }
-
-        if (result && result.assumptions && result.assumptions.length > 0) {
-          body.push(
-            h('div', {
-              key: 'assumptions',
-              className: 'dsp-assumptions' + (assumptionsOpen ? ' open' : ''),
-              onMouseEnter: () => setAssumptionsOpen(true),
-              onMouseLeave: () => setAssumptionsOpen(false),
-            },
-              h('button', {
-                className: 'dsp-assumptions-head',
-                type: 'button',
-                'aria-expanded': assumptionsOpen ? 'true' : 'false',
-                onClick: () => setAssumptionsOpen((value) => !value),
-              },
-                t('这条结论依赖的假设', 'Assumptions behind this'),
-                ` · ${result.assumptions.length}`,
-                h('span', { className: 'dsp-assumptions-caret' }, assumptionsOpen ? '▴' : '▾'),
-              ),
-              assumptionsOpen
-                ? h(React.Fragment, null,
-                    ...result.assumptions.map((text, index) =>
-                      h('div', { key: index, className: 'dsp-asm' }, `· ${text}`)),
-                    h('button', {
-                      className: 'dsp-btn',
-                      type: 'button',
-                      style: { alignSelf: 'flex-start', marginTop: '2px' },
-                      disabled: assumptionsSaved || Boolean(pinnedId),
-                      onClick: saveAssumptionsOnly,
-                    }, assumptionsSaved || pinnedId
-                      ? t('假设已存入台账', 'Assumptions saved')
-                      : t('只存假设', 'Save assumptions only')),
-                  )
-                : null,
-            ),
-          )
+          body.push(h(TraceTools, { key: 'trace-tools', en, filter, onFilter: setFilter,
+            timeline: buildTimeline(result),
+            onJump: node => void jumpTo({ seq: node.seq, quote: node.quote }, keywordsFor(result, node.seq)),
+            assumptions: result.assumptions || [], assumptionsSaved: assumptionsSaved || Boolean(pinnedId),
+            onSaveAssumptions: saveAssumptionsOnly,
+          }))
         }
 
         if (mode === 'loading') {
           body.push(
             h('div', { className: 'dsp-note', key: 'loading', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-              h('span', { className: 'dsp-spin' }),
+              h(LoadingSpinner),
               t(`正在回看前面的对话… ${elapsed}s`, `Reading back through the conversation… ${elapsed}s`),
             ),
           )
@@ -4393,7 +4543,7 @@ window.__ModuleLoader__.load({
             if (extra.status === 'loading') {
               items.push(
                 h('div', { key: 'x-loading', className: 'dsp-note', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-                  h('span', { className: 'dsp-spin' }),
+                  h(LoadingSpinner),
                   t('正在检索并抓取网页…', 'Searching and fetching pages…')),
               )
             } else if (extra.status === 'error') {
@@ -4436,7 +4586,7 @@ window.__ModuleLoader__.load({
               { id: 'assumptions', label: `${t('假设', 'Assumptions')} · ${sessionAssumptions.length}` },
               { id: 'notes', label: `${t('摘录', 'Notes')} · ${sessionNotes.length}` },
             ],
-            active: panelTab, onSelect: value => { setPanelTab(value); setShowTrash(false); setRecycleStatus('') }, en,
+            active: panelTab, onSelect: value => { setPanelTab(value); setShowTrash(false); setRecycleStatus(''); bodyRef.current?.scrollTo({ top: 0 }) }, en,
           }),
           h('button', {
             className: 'dsp-tab-export',
@@ -4455,10 +4605,11 @@ window.__ModuleLoader__.load({
             for (const note of visibleNotes) {
               body.push(
                 h('div', { key: note.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text' }, markedSearchText(note.text, panelQuery)),
-                  h('div', { className: 'dsp-note-meta' },
-                    h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
-                  ),
+                  h(CollapsibleText, { text: note.text, en, variant: 'record', content: markedSearchText(note.text, panelQuery),
+                    metadata: h('div', { className: 'dsp-note-meta' },
+                      h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
+                    ),
+                  }),
                   h('div', { className: 'dsp-note-actions' },
                     h('button', { className: 'dsp-btn', type: 'button', disabled: Boolean(note.sessionId && note.sessionId !== sessionId), 'data-dsp-jump': '', onClick: () => jumpToNote(note) }, t('跳转原文', 'Jump')),
                     h('button', { className: 'dsp-btn danger', type: 'button', onClick: () => removeNote(note.id) }, t('删除', 'Delete')),
@@ -4477,14 +4628,15 @@ window.__ModuleLoader__.load({
               const evidenceCount = (decision.atoms || []).reduce((sum, atom) => sum + (atom.evidence ? atom.evidence.length : 0), 0)
               body.push(
                 h('div', { key: decision.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text', style: { fontWeight: 600 } }, markedSearchText(decision.claim, panelQuery)),
-                  h('div', { className: 'dsp-note-meta' },
-                    h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
-                    ` · ${evidenceCount} ${t('条依据', 'sources')}`,
-                    decision.status === 'revoked' ? ` · ${t('已撤销', 'revoked')}` : '',
-                  ),
+                  h(CollapsibleText, { text: decision.claim, en, variant: 'record', style: { fontWeight: 600 }, content: markedSearchText(decision.claim, panelQuery),
+                    metadata: h('div', { className: 'dsp-note-meta' },
+                      h(CompactMeta, { time: decision.createdAt, seq: decision.claimSeq, sessionId: decision.sessionId, en }),
+                      ` · ${evidenceCount} ${t('条依据', 'sources')}`,
+                      decision.status === 'revoked' ? ` · ${t('已撤销', 'revoked')}` : '',
+                    ),
+                  }),
                   (decision.assumptions || []).length > 0
-                    ? h('div', { className: 'dsp-asms' }, ...decision.assumptions.map((text, index) => h('span', { key: index, className: 'dsp-asm' }, markedSearchText(text, panelQuery))))
+                    ? h(CollapsibleText, { text: decision.assumptions.join('\n'), en, variant: 'record', className: 'dsp-asm', content: markedSearchText(decision.assumptions.join('\n'), panelQuery) })
                     : null,
                   h('div', { className: 'dsp-note-actions' },
                     h('button', { className: 'dsp-btn', type: 'button', 'data-dsp-jump': '', onClick: () => runJump(decision.claim, decision.claimSeq, decision.sessionId) }, t('跳转原文', 'Jump')),
@@ -4504,9 +4656,9 @@ window.__ModuleLoader__.load({
             for (const item of visibleAssumptions) {
               body.push(
                 h('div', { key: item.id, className: 'dsp-note-item' },
-                  h('div', { className: 'dsp-note-text' }, markedSearchText(item.text, panelQuery)),
+                  h(CollapsibleText, { text: item.text, en, variant: 'record', content: markedSearchText(item.text, panelQuery) }),
                   item.sourceClaim
-                    ? h('div', { className: 'dsp-note-meta' }, `${t('来源', 'From')}：`, markedSearchText(panelQuery ? item.sourceClaim : item.sourceClaim.slice(0, 80), panelQuery))
+                    ? h(CollapsibleText, { text: `${t('来源', 'From')}：${item.sourceClaim}`, en, variant: 'record', className: 'dsp-note-meta', content: markedSearchText(`${t('来源', 'From')}：${item.sourceClaim}`, panelQuery) })
                     : null,
                   h('div', { className: 'dsp-note-actions' },
                     ...STATUS_LABELS.map(([value, label]) =>
@@ -4571,7 +4723,6 @@ window.__ModuleLoader__.load({
           }
         }
 
-        body.unshift(tabs)
 
         const localTotal = panelTab === 'notes' ? sessionNotes.length : panelTab === 'decisions' ? sessionDecisions.length : sessionAssumptions.length
         const localVisible = panelTab === 'notes' ? visibleNotes.length : panelTab === 'decisions' ? visibleDecisions.length : visibleAssumptions.length
@@ -4611,6 +4762,7 @@ window.__ModuleLoader__.load({
                         }, t('打开对话', 'Open chat'))
                       : null,
                   ),
+                  h('span', { className: 'dsp-foot-divider', 'aria-hidden': true }),
                   searchDock,
                 ),
                 !panelQuery && (result || error) ? h('div', { className: 'dsp-foot-grid' },
@@ -4653,8 +4805,9 @@ window.__ModuleLoader__.load({
         const relatedIssue = related.status === 'error' || related.status === 'unavailable' || related.failedSessions > 0
         if (inRelated) {
           body.length = 0
-          body.push(tabs,
-            h('div', { key: 'related-claim', className: 'dsp-claim' }, `「${claim}」`),
+          body.push(
+            h(CollapsibleText, { text: claim, en, variant: 'claim', key: `related-claim-${claim}` }),
+            isAnalyzing ? h('div', { key: 'related-cancel', className: 'dsp-claim-actions' }, cancelControl) : null,
             h('div', { key: 'related-description', className: 'dsp-note' },
               t('这些是其他会话中的候选关联，不代表 AI 当时引用过它们。先看原文，需要时再分析关系。',
                 'These are related passages from other sessions, not proof that the AI originally used them. Review the sources before analyzing.')),
@@ -4719,12 +4872,14 @@ window.__ModuleLoader__.load({
               ...(size.h ? { height: size.h } : {}),
             },
           },
+            h(AnalysisAtmosphere, { key: 'thinking', active: thinkingEffects && isAnalyzing && panelTab === 'trace' && !showTrash && !panelQuery }),
             header,
             recycleStatus ? h('div', { className: 'dsp-toast', key: 'recycle-status', role: 'status' }, recycleStatus)
               : notice || reading.history.length ? h('div', { className: 'dsp-toast dsp-reading-notice', key: 'toast' },
                 reading.history.length ? h('button', { type: 'button', className: 'dsp-btn dsp-back-reading',
                   disabled: reading.returning, onClick: backToReading }, reading.returning ? t('正在返回…', 'Returning…') : t('↶ 返回刚才的位置', '↶ Back to reading')) : null,
                 notice ? h('span', { role: 'status' }, notice) : null) : null,
+            showTrash ? null : tabs,
             h('div', { className: 'dsp-body', ref: bodyRef, onWheel: bounceAtEdge }, ...body),
             showTrash || inRelated ? null : footer,
             showTrash || panelTab === 'trace' ? null : searchDock,
@@ -4797,7 +4952,14 @@ window.__ModuleLoader__.load({
       return h('span', { className, title: meta.title }, meta.label)
     }
 
-    function EvidenceQuote({ text, en }) {
+    function EvidenceQuote(props) {
+      return h(CollapsibleText, props)
+    }
+
+    function CollapsibleText({ text, en, variant = 'evidence', content, className, style, metadata }) {
+      const isClaim = variant === 'claim'
+      const isRecord = variant === 'record'
+      const quoteId = React.useId()
       const ref = React.useRef(null)
       const [expanded, setExpanded] = React.useState(false)
       const [overflow, setOverflow] = React.useState(false)
@@ -4811,12 +4973,13 @@ window.__ModuleLoader__.load({
         const observer = new ResizeObserver(measure); observer.observe(element)
         return () => observer.disconnect()
       }, [text, expanded])
-      return h('div', { className: 'dsp-quote-wrap' },
-        h('div', { ref, className: 'dsp-ev-quote' + (expanded ? ' expanded' : ' clamped') }, `「${text}」`),
-        overflow || expanded ? h('button', { type: 'button', className: 'dsp-quote-toggle', 'aria-expanded': expanded,
-          title: en ? 'Expand or collapse the quote without jumping' : '仅展开或收起引文，不跳转',
+      const toggle = overflow || expanded ? h('button', { type: 'button', className: 'dsp-quote-toggle' + (isClaim ? ' dsp-claim-toggle' : isRecord ? ' dsp-record-toggle' : ''), 'aria-expanded': expanded, 'aria-controls': quoteId,
+          title: isRecord ? (en ? 'Show or hide the full text' : '查看或收起全文') : isClaim ? (en ? 'Show or hide the full selected passage' : '展开或收起完整选文') : (en ? 'Expand or collapse the quote without jumping' : '仅展开或收起引文，不跳转'),
           onClick: event => { event.stopPropagation(); setExpanded(value => !value) },
-          onKeyDown: event => event.stopPropagation() }, expanded ? (en ? 'Collapse' : '收起') : (en ? 'Expand quote' : '展开引文')) : null,
+          onKeyDown: event => event.stopPropagation() }, expanded ? (en ? 'Collapse' : '收起') : isRecord ? (en ? 'View full text' : '查看全文') : isClaim ? (en ? 'Expand selection' : '展开原文') : (en ? 'Expand quote' : '展开引文')) : null
+      return h('div', { className: isClaim ? 'dsp-claim dsp-claim-preview' : isRecord ? 'dsp-record-preview' : 'dsp-quote-wrap' },
+        h('div', { ref, id: quoteId, className: (isClaim ? 'dsp-claim-text' : isRecord ? `${className || 'dsp-note-text'} dsp-record-text` : 'dsp-ev-quote') + (expanded ? ' expanded' : ' clamped'), style }, isRecord ? (content ?? text) : `「${text}」`),
+        isRecord ? (metadata || toggle ? h('div', { className: 'dsp-record-row' }, metadata, toggle) : null) : toggle,
       )
     }
 
