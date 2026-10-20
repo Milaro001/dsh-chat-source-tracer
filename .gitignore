@@ -5,3 +5,18 @@ node_modules/
 verification/
 dist/
 *.zip
+
+# Local credentials, exports and machine-specific files
+.env
+.env.*
+.npmrc
+.netrc
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.har
+dsh-session-*.json
+session-export*.json
