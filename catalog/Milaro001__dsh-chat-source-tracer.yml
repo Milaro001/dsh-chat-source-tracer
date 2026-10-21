@@ -2,6 +2,6 @@ url: https://github.com/Milaro001/dsh-chat-source-tracer
 name: Milaro001/dsh-chat-source-tracer
 category: session
 description:
-  en: Trace AI answer sources in chat history, search across sessions, save excerpts and decisions, and ask follow-up questions with original quotes.
-  zh: 追溯 AI 回答关联的历史消息与工具材料，检索跨会话内容，保存摘录与结论，并引用原文继续追问。
+  en: Select a statement in an AI answer, find candidate support in earlier chat and tool records, classify support, and jump to original passages for review.
+  zh: 选中 AI 回答中的一句话，反查此前对话与工具记录中的候选依据，区分直接依据、推论和未找到依据，并跳回原文核对。
 tarball: https://github.com/Milaro001/dsh-chat-source-tracer/releases/download/v0.3.1/dsh-chat-source-tracer-0.3.1.tgz
