@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Provenance Lens",
+    "title": "DSH Chat Source Tracer",
     "description": "Select a sentence in a long conversation to see which earlier questions, conclusions, and external sources support it; keep decisions, assumptions, and excerpts in an exportable archive."
   },
   "panel": {

@@ -1,14 +1,20 @@
-# 上下文溯源透镜
+# DSH 对话溯源助手
 
-**dsh-provenance-lens · V0.3（0.3.0）**
+**dsh-chat-source-tracer · V0.3.1（0.3.1）**
 
-上下文溯源透镜帮助你在 DeepSeek Harness 的长对话中核对 AI 回答的依据。打开「溯源」，选中一句话或一段文字，就能查看相关的历史消息和工具材料，区分原文支持的内容与推论，再点一下回到来源位置。
+DSH 对话溯源助手帮助你在 DeepSeek Harness 的长对话中核对 AI 回答的依据。打开「溯源」，选中一句话或一段文字，就能查看相关的历史消息和工具材料，区分原文支持的内容与推论，再点一下回到来源位置。
 
 有用的原句可以存成摘录，重要的结论和待确认的假设也能分别保留，最后导出成档案。它适合研究资料、整理方案和反复调整需求：既方便回头核对，也能把散落在长对话里的内容整理起来。
 
 > 溯源结果是根据已有文本作出的关联分析，不代表模型真实的生成过程。0.x 版本仍在持续完善，归因准确率、真实超长会话和不同 DSH 版本的兼容性仍需持续验证。
 
 ## 版本更新
+
+### V0.3.1 · 2026-10-21
+
+- **名称更直观**：项目名称统一为 `dsh-chat-source-tracer`，中文名为「DSH 对话溯源助手」。
+- **安装与反馈入口统一**：仓库地址、插件包名、运行入口、文档与市场条目使用新名称，重新提供安装包与源码交付包。
+- **保留已有档案**：继续使用原有本地存储键，摘录、结论、假设和界面偏好保持兼容。
 
 ### V0.3 · 2026-10-20
 
@@ -95,17 +101,19 @@
 
 本插件适用于 **DeepSeek Harness**，已验证环境为 **DSH 0.2.1-rc.2**。使用归因分析前，需要在 DSH 中配置可用的模型提供方。
 
-从 [V0.3 Release](https://github.com/Milaro001/dsh-provenance-lens/releases/tag/v0.3.0) 下载 `.tgz` 安装包，或通过命令安装：
+从 [V0.3.1 Release](https://github.com/Milaro001/dsh-chat-source-tracer/releases/tag/v0.3.1) 下载 `.tgz` 安装包，或通过命令安装：
 
 ```sh
-dsh plugin add https://github.com/Milaro001/dsh-provenance-lens/releases/download/v0.3.0/dsh-provenance-lens-0.3.0.tgz
+dsh plugin add https://github.com/Milaro001/dsh-chat-source-tracer/releases/download/v0.3.1/dsh-chat-source-tracer-0.3.1.tgz
 ```
 
 也可使用仓库来源：
 
 ```sh
-dsh plugin add https://github.com/Milaro001/dsh-provenance-lens
+dsh plugin add https://github.com/Milaro001/dsh-chat-source-tracer
 ```
+
+由旧包名安装的版本，请先停用旧插件，再安装新包并重载，避免出现重复入口。档案与界面偏好沿用原有本地存储。
 
 桌面版未配置 `dsh` 命令时，可在插件管理界面的安装入口填写相同来源。安装或更新后重载插件，确认输入框旁出现「溯源」。多个来源的版本应只启用一个，避免重复入口。
 
@@ -115,7 +123,7 @@ dsh plugin add https://github.com/Milaro001/dsh-provenance-lens
 4. 保存需要的摘录、结论和假设。
 5. 从档案导出 Markdown 或 JSON 进行备份。
 
-Release 中的 `.tgz` 用于安装，ZIP 用于下载源码。当前为 0.x 版本，社区市场尚未收录。
+Release 中的 `.tgz` 用于安装，ZIP 用于下载源码。当前为 0.x 版本，社区市场收录以目录维护者审核与合并结果为准。
 
 ## 数据与模型用量
 
@@ -127,7 +135,7 @@ Release 中的 `.tgz` 用于安装，ZIP 用于下载源码。当前为 0.x 版�
 
 ## 反馈与支持
 
-报错、功能建议和使用反馈请提交到 [Issues](https://github.com/Milaro001/dsh-provenance-lens/issues/new/choose)。问题描述建议包含插件版本、DSH 版本、操作步骤和实际结果。发布截图或示例前，请移除私人对话、密钥和个人信息。
+报错、功能建议和使用反馈请提交到 [Issues](https://github.com/Milaro001/dsh-chat-source-tracer/issues/new/choose)。问题描述建议包含插件版本、DSH 版本、操作步骤和实际结果。发布截图或示例前，请移除私人对话、密钥和个人信息。
 
 更多反馈方式见 [支持说明](SUPPORT.md)，测试范围见 [验证说明](docs/TESTING.md)，发布流程见 [发布说明](PUBLISHING.md)。
 

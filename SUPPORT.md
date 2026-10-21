@@ -4,13 +4,13 @@
 
 ## 提交反馈
 
-前往 [Issues](https://github.com/Milaro001/dsh-provenance-lens/issues/new/choose)，选择对应模板：
+前往 [Issues](https://github.com/Milaro001/dsh-chat-source-tracer/issues/new/choose)，选择对应模板：
 
 - **报告问题**：填写插件版本、DSH 版本、复现步骤、预期表现和实际结果。
 - **功能建议**：说明使用场景、遇到的困难和希望增加的能力。
 - **使用反馈**：分享使用体验、界面建议或其他改进意见。
 
-一般使用交流和开放讨论可前往 [Discussions](https://github.com/Milaro001/dsh-provenance-lens/discussions)。
+一般使用交流和开放讨论可前往 [Discussions](https://github.com/Milaro001/dsh-chat-source-tracer/discussions)。
 
 ## 公开内容
 

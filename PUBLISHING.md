@@ -1,10 +1,10 @@
 # 发布与市场收录
 
-GitHub Release 用于分发插件安装包，社区市场收录需另行提交。当前发布版本为 `0.3.0`，对应 tag 为 `v0.3.0`；社区市场尚未提交。
+GitHub Release 用于分发插件安装包，社区市场收录需另行提交。当前发布版本为 `0.3.1`，对应 tag 为 `v0.3.1`。社区市场收录通过目录 PR 另行审核。
 
 ## 仓库与分发文件
 
-- 仓库地址：[Milaro001/dsh-provenance-lens](https://github.com/Milaro001/dsh-provenance-lens)。仓库应公开可访问，并配置 `dsh-plugin` topic。
+- 仓库地址：[Milaro001/dsh-chat-source-tracer](https://github.com/Milaro001/dsh-chat-source-tracer)。仓库应公开可访问，并配置 `dsh-plugin` topic。
 - `package.json` 的版本、lockfile、Release tag 与分发文件名应一致，`repository` 应指向本仓库。
 - 安装包需包含 `dsh.bundle`、对应 patch、运行代码、图标、语言文件、许可证和必要说明。
 - `.tgz` 用于插件安装，ZIP 用于源码分发。发布文件按 `package.json` 的 `files` 清单生成。
@@ -26,14 +26,14 @@ npm pack --ignore-scripts
 
 ## 社区市场提交
 
-提交前核对最新的 [贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md) 和 [提交检查器](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/scripts/check-submission.mjs)。以下为 2026-10-20 整理的检查项：
+提交前核对最新的 [贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md) 和 [提交检查器](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/scripts/check-submission.mjs)。以下为 2026-10-21 核对的检查项：
 
 | 检查项 | 要求 |
 | --- | --- |
 | 仓库 | 公开可访问，创建满 1 天，包含可用源码、准确描述和 `dsh-plugin` topic |
 | 插件配置 | `dsh.bundle` 指向有效 patch，patch 包名与项目名一致 |
-| 市场条目 | 使用 `catalog/Milaro001__dsh-provenance-lens.yml`，分类为 `session`，描述与功能一致 |
-| 提交路径 | 在市场仓库新增 `data/plugins/Milaro001__dsh-provenance-lens.yml`，不修改生成的 README 或其他插件条目 |
+| 市场条目 | 使用 `catalog/Milaro001__dsh-chat-source-tracer.yml`，分类为 `session`，描述与功能一致 |
+| 提交路径 | 在市场仓库新增 `data/plugins/Milaro001__dsh-chat-source-tracer.yml`，不修改生成的 README 或其他插件条目 |
 | 截图 | 在本仓库的 `screenshots.json` 中声明有效图片路径，不向旧的截图汇总文件添加条目 |
 | 安装来源 | 源码应可直接安装；否则必须提供预构建 `.tgz` |
 | `tarball` | 使用 GitHub Release 的 HTTPS `.tgz` 链接，ZIP 不用于此字段 |

@@ -37,7 +37,7 @@ window.fixtureWebRequests=[]
 window.fixtureRelationRequests=[]
 window.fixtureViewActivations=[]
 window.fetch=async (url,init)=>{
- if(!/^\/plugins\/dsh-provenance(?:-lens)?\//.test(String(url)))return realFetch(url,init)
+ if(!/^\/plugins\/dsh-chat-source-tracer\//.test(String(url)))return realFetch(url,init)
  const body=JSON.parse(init.body||'{}')
  if(String(url).endsWith('/related')){
   const request={...body,mode:relatedMode,completed:false};window.fixtureRelatedRequests.push(request)
@@ -148,7 +148,7 @@ function App(){
  const Panel=handlers.get('shell.overlay')
  const Archive=handlers.get('conversation.view')
  return h(React.Fragment,null,
-  h('div',{className:'fixture-toolbar'},h('b',null,'溯源透镜 · 本地验证'),h('button',{id:'run-tests',onClick:()=>void runTests()},'运行浏览器回归测试'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗'),h('button',{id:'switch-session',onClick:()=>setActiveSession(id=>id==='synthetic'?'synthetic-other':'synthetic')},'切换测试会话'),h('button',{id:'stress-message',onClick:()=>setLargeMessage(value=>!value)},'长消息验证'),h('button',{id:'toggle-archive',onClick:()=>setArchive(value=>!value)},'查看测试档案'),h('button',{id:'demo-followup',onClick:()=>void demoFollowup()},'演示原文追问'),h('button',{id:'demo-long-selection',title:'Shift + 点击演示取消分析',onClick:event=>void(event.shiftKey?demoCancelAnalysis():demoLongSelection())},'演示长选文'),h('span',{id:'test-summary'},'等待运行')),
+  h('div',{className:'fixture-toolbar'},h('b',null,'DSH 对话溯源助手 · 本地验证'),h('button',{id:'run-tests',onClick:()=>void runTests()},'运行浏览器回归测试'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗'),h('button',{id:'switch-session',onClick:()=>setActiveSession(id=>id==='synthetic'?'synthetic-other':'synthetic')},'切换测试会话'),h('button',{id:'stress-message',onClick:()=>setLargeMessage(value=>!value)},'长消息验证'),h('button',{id:'toggle-archive',onClick:()=>setArchive(value=>!value)},'查看测试档案'),h('button',{id:'demo-followup',onClick:()=>void demoFollowup()},'演示原文追问'),h('button',{id:'demo-long-selection',title:'Shift + 点击演示取消分析',onClick:event=>void(event.shiftKey?demoCancelAnalysis():demoLongSelection())},'演示长选文'),h('span',{id:'test-summary'},'等待运行')),
   h('div',{'data-slot':'conversation.session',style:{display:'contents'}}),
   h('main',{'data-conversation-session':activeSession,'data-conversation-content':'','data-conversation-region':'chat',className:'conversation'},h('header',null,'测试会话',h('span',null,'所有内容均为虚构测试文本'),
    h('div',{'data-conversation-tabs':'',role:'tablist','aria-label':'测试视图'},

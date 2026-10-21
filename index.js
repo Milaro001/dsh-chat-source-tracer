@@ -10,19 +10,19 @@ import { searchRelated, relationshipContext, validateRelationships, RELATION_SYS
  * credentials. The browser half posts a selection to this route and renders the
  * validated result.
  *
- * Route: POST /plugins/dsh-provenance-lens/trace
+ * Route: POST /plugins/dsh-chat-source-tracer/trace
  * Body:  { sessionId, quote, prefix?, suffix? }
  * Reply: { ok: true, claim, atoms, meta } | { ok: false, error, message }
  */
 
-const ROUTE = '/plugins/dsh-provenance-lens/trace'
-const MESSAGE_ROUTE = '/plugins/dsh-provenance-lens/message'
-const LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate'
-const EVIDENCE_LOCATE_ROUTE = '/plugins/dsh-provenance-lens/locate-evidence'
-const CORROBORATE_ROUTE = '/plugins/dsh-provenance-lens/corroborate'
-const SEARCH_ROUTE = '/plugins/dsh-provenance-lens/search'
-const RELATED_ROUTE = '/plugins/dsh-provenance-lens/related'
-const RELATION_ROUTE = '/plugins/dsh-provenance-lens/relationships'
+const ROUTE = '/plugins/dsh-chat-source-tracer/trace'
+const MESSAGE_ROUTE = '/plugins/dsh-chat-source-tracer/message'
+const LOCATE_ROUTE = '/plugins/dsh-chat-source-tracer/locate'
+const EVIDENCE_LOCATE_ROUTE = '/plugins/dsh-chat-source-tracer/locate-evidence'
+const CORROBORATE_ROUTE = '/plugins/dsh-chat-source-tracer/corroborate'
+const SEARCH_ROUTE = '/plugins/dsh-chat-source-tracer/search'
+const RELATED_ROUTE = '/plugins/dsh-chat-source-tracer/related'
+const RELATION_ROUTE = '/plugins/dsh-chat-source-tracer/relationships'
 const BODY_LIMIT = 512 * 1024
 const MAX_ATOMS = 6
 const MAX_EVIDENCE_PER_ATOM = 3

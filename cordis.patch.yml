@@ -1,3 +1,3 @@
 - insert:
-    - id: dsh-provenance-lens
-      name: 'dsh-provenance-lens'
+    - id: dsh-chat-source-tracer
+      name: 'dsh-chat-source-tracer'

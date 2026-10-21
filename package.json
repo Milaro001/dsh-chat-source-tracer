@@ -1,29 +1,34 @@
 {
-  "name": "dsh-provenance-lens",
-  "version": "0.3.0",
-  "description": "Trace conversation sources, search across chats, manage excerpts and decisions, and quote original passages to continue a discussion.",
+  "name": "dsh-chat-source-tracer",
+  "version": "0.3.1",
+  "description": "Trace AI answer sources in DeepSeek Harness chats, search across sessions, save excerpts and decisions, and ask follow-up questions with original quotes.",
   "type": "module",
   "license": "MIT",
-  "author": "dsh-provenance-lens contributors",
+  "author": "dsh-chat-source-tracer contributors",
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek",
     "deepseek-harness",
-    "cordis",
+    "chat-history",
+    "chat-search",
+    "source-tracing",
+    "source-attribution",
     "provenance",
-    "citation",
-    "long-context",
-    "decision-log",
-    "notes",
-    "溯源"
+    "evidence",
+    "cross-session-search",
+    "research",
+    "note-taking",
+    "溯源",
+    "对话检索"
   ],
-  "homepage": "https://github.com/Milaro001/dsh-provenance-lens#readme",
+  "homepage": "https://github.com/Milaro001/dsh-chat-source-tracer#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Milaro001/dsh-provenance-lens.git"
+    "url": "git+https://github.com/Milaro001/dsh-chat-source-tracer.git"
   },
   "bugs": {
-    "url": "https://github.com/Milaro001/dsh-provenance-lens/issues"
+    "url": "https://github.com/Milaro001/dsh-chat-source-tracer/issues"
   },
   "exports": {
     ".": "./index.js",
