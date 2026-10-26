@@ -23,11 +23,31 @@ const relatedSources=[
  {seq:4,role:'user',turn:1,messageId:'other-user',quote:'紫杉协议采用环形索引，确保长对话中的定位一致性。但我后来想补充一个恢复方案。'},
 ]
 const traceResult={ok:true,claim:{seq:900,role:'assistant',turn:600,step:1,resolved:true},atoms:sources.map((ev,i)=>({text:['采用环形索引以保证定位一致性','保留长对话中的原文定位能力','这项设计需要核对外部协议'][i],relation:i===1?'inference':'direct',keywords:['紫杉协议','环形索引','定位'],evidence:[{...ev,why:'与这句话讨论的是同一项约束。',strength:'strong'}]})),assumptions:['历史记录保存完整，且目标消息尚未被修改。'],meta:{model:'本地测试替身',elapsedMs:42,messageCount:20000,retrieval:{scannedMessages:20000,selectedPassages:23}}}
+const graphDemo = new URLSearchParams(location.search).has('graph-demo')
+if(graphDemo){
+ const time=Date.UTC(2026,9,26,10,0)
+ const decisions=[
+  ['ring','环形索引让紫杉协议在长对话中准确定位原文。',['紫杉协议','环形索引','原文定位'],sources[0]],
+  ['check','原文定位后，仍需要逐段核对来源与上下文。',['原文定位','来源核对','上下文'],sources[1]],
+  ['restore','恢复方案通过消息编号重新连接来源。',['恢复方案','消息编号','来源核对'],sources[2]],
+  ['context','上下文保存完整，有助于恢复原文定位。',['上下文','恢复方案','原文定位'],sources[0]],
+ ].map(([id,claim,keywords,evidence],i)=>({id,claim,sessionId:'synthetic',claimSeq:900,createdAt:time+i*1000,status:'active',assumptions:[],atoms:[{text:claim,relation:i===1?'inference':'direct',keywords,evidence:[evidence]}]}))
+ const assumptions=[{id:'complete',decisionId:'ring',text:'紫杉协议的历史消息仍然保存完整。',sourceClaim:decisions[0].claim},
+  {id:'identity',decisionId:'restore',text:'恢复方案使用的消息编号不会被重复分配。',sourceClaim:decisions[2].claim}].map(item=>({...item,sessionId:'synthetic',status:'open',createdAt:time}))
+ const notes=[...sources.map((source,i)=>({id:`source-${i}`,text:source.quote,quote:source.quote,seq:source.seq,role:source.role})),
+  {id:'local',text:'环形索引与恢复方案都需要保留消息编号。'},
+  {id:'context-note',text:'上下文与来源核对是原文定位之后的下一步。'},
+  {id:'island',text:'独立记录：界面配色可以保留较低饱和度。'}].map((item,i)=>({...item,sessionId:'synthetic',createdAt:time+i*1000}))
+ notes.push({id:'other-session',text:'另一会话也在讨论紫杉协议与恢复方案。',sessionId:'synthetic-other',createdAt:time+12000})
+ localStorage.setItem('dsh-provenance:ledger:v1',JSON.stringify({decisions,assumptions,notes,trash:[]}))
+}
 const realFetch=window.fetch.bind(window)
 let traceFailure = null
 let relatedMode = 'normal'
 let traceBehavior = 'normal'
 let relationBehavior = 'normal'
+let diagramBehavior = 'normal'
+window.fixtureDiagramRequests=[]
 window.fixtureRelatedRequests=[]
 window.fixtureRelationCalls=0
 window.fixtureSearchRequests=[]
@@ -39,6 +59,13 @@ window.fixtureViewActivations=[]
 window.fetch=async (url,init)=>{
  if(!/^\/plugins\/dsh-chat-source-tracer\//.test(String(url)))return realFetch(url,init)
  const body=JSON.parse(init.body||'{}')
+ if(String(url).endsWith('/diagram')){
+  const request={aborted:false,completed:false,body};window.fixtureDiagramRequests.push(request)
+  init.signal?.addEventListener('abort',()=>{request.aborted=true},{once:true})
+  const response=await realFetch(url,{...init,...(diagramBehavior==='late'?{signal:undefined}:{})})
+  if(diagramBehavior==='late')await new Promise(resolve=>setTimeout(resolve,900))
+  request.completed=true;return response
+ }
  if(String(url).endsWith('/related')){
   const request={...body,mode:relatedMode,completed:false};window.fixtureRelatedRequests.push(request)
   let response
@@ -140,7 +167,7 @@ function App(){
  const [old,setOld]=React.useState(false)
  const [messageEpoch,setMessageEpoch]=React.useState(0)
  remountMessages=()=>setMessageEpoch(value=>value+1)
- const [archiveVisible,setArchive]=React.useState(false)
+ const [archiveVisible,setArchive]=React.useState(graphDemo)
  setArchiveVisible=setArchive
  setOldVisible=setOld
  React.useEffect(()=>{const script=document.createElement('script');script.src='/client.js';script.onload=()=>setReady(true);document.body.append(script)},[])
@@ -150,6 +177,8 @@ function App(){
  return h(React.Fragment,null,
   h('div',{className:'fixture-toolbar'},h('b',null,'DSH 对话溯源助手 · 本地验证'),h('button',{id:'run-tests',onClick:()=>void runTests()},'运行浏览器回归测试'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗'),h('button',{id:'switch-session',onClick:()=>setActiveSession(id=>id==='synthetic'?'synthetic-other':'synthetic')},'切换测试会话'),h('button',{id:'stress-message',onClick:()=>setLargeMessage(value=>!value)},'长消息验证'),h('button',{id:'toggle-archive',onClick:()=>setArchive(value=>!value)},'查看测试档案'),h('button',{id:'demo-followup',onClick:()=>void demoFollowup()},'演示原文追问'),h('button',{id:'demo-long-selection',title:'Shift + 点击演示取消分析',onClick:event=>void(event.shiftKey?demoCancelAnalysis():demoLongSelection())},'演示长选文'),h('span',{id:'test-summary'},'等待运行')),
   h('div',{'data-slot':'conversation.session',style:{display:'contents'}}),
+  ready&&graphDemo&&h('button',{id:'run-graph-dock-tests',onClick:()=>void runGraphDockTests(),style:{position:'fixed',top:16,right:20,zIndex:20}},'检查底部呼出'),
+  ready&&graphDemo&&h('button',{id:'run-diagram-tests',onClick:()=>void runDiagramWorkspaceTests(),style:{position:'fixed',top:16,right:140,zIndex:20}},'检查导图工作台'),
   h('main',{'data-conversation-session':activeSession,'data-conversation-content':'','data-conversation-region':'chat',className:'conversation'},h('header',null,'测试会话',h('span',null,'所有内容均为虚构测试文本'),
    h('div',{'data-conversation-tabs':'',role:'tablist','aria-label':'测试视图'},
     h('button',{type:'button',role:'tab','aria-selected':!archiveVisible,onClick:()=>setArchive(false)},'对话'),
@@ -161,11 +190,121 @@ function App(){
     h(SourceNode,{key:messageEpoch,node:{kind:'assistant-step',data:{turn:600,step:1,finalNode:{seq:900,kind:'assistant',messageId:'current-ai'}}}},h('small',null,'AI 当前回答'),h('p',{id:'claim'},longSelection?longSelectionText:claim),h('p',null,'这段回答用于检查历史依据的加载、消息限定和关键词高亮。'),h('p',{id:'decoy'},'紫杉协议采用环形索引，确保长对话中的定位一致性。 该协议保留原文的段落结构。')),
    )),
    h('footer',null,h('textarea',{id:'fixture-composer','aria-label':'测试输入框',defaultValue:draftState.draft,onChange:event=>{draftState.draft=event.target.value;draftState.draftRev++},style:{flex:1,minWidth:0,height:70,resize:'vertical',border:'1px solid var(--dsw-alias-border-l2)',borderRadius:10,background:'var(--dsw-alias-bg-base)',color:'var(--dsw-alias-label-primary)',padding:10}}),ready&&h(Trigger,{sessionId:activeSession}))),
-  ready&&archiveVisible&&h('div',{id:'fixture-archive',style:{position:'fixed',top:82,left:32,right:470,bottom:24,zIndex:3,background:'var(--dsw-alias-bg-base)'}},h(Archive,{sessionId:activeSession})),
+  ready&&archiveVisible&&h('div',{id:'fixture-archive',style:{position:'fixed',top:82,left:32,right:graphDemo?'auto':470,
+   width:graphDemo?`min(${new URLSearchParams(location.search).has('narrow')?420:1000}px, calc(100vw - 64px))`:undefined,
+   bottom:24,zIndex:3,background:'var(--dsw-alias-bg-base)'}},h(Archive,{sessionId:activeSession})),
   ready&&h(Panel),h('pre',{id:'test-results'}))
 }
 const wait=ms=>new Promise(r=>setTimeout(r,ms))
 async function until(check,label){const until=Date.now()+5000;while(Date.now()<until){if(check())return;await wait(30)}throw Error(label)}
+async function runDiagramWorkspaceTests(){
+ const checks=[]
+ const report=(name,ok,detail='')=>{checks.push({name,ok,detail});document.querySelector('#test-results').textContent=JSON.stringify(checks,null,2)}
+ const test=async(name,fn)=>{try{await fn();report(name,true)}catch(error){report(name,false,String(error))}}
+ const dialog=()=>document.querySelector('.dmd-dialog')
+ const button=text=>[...dialog().querySelectorAll('button')].find(node=>node.textContent===text)
+ const open=async()=>{[...document.querySelectorAll('.dpl-head button')].find(node=>node.textContent==='生成导图').click();await until(dialog,'未打开工作台')}
+ const initialRequests=window.fixtureDiagramRequests.length
+ await test('从结论档案打开工作台，不自动调用模型',async()=>{
+  await open();await until(()=>dialog().querySelector('.dmd-artboard svg'),'没有 SVG 预览')
+  if(window.fixtureDiagramRequests.length!==initialRequests)throw Error('打开预览消耗了模型调用')
+  if(dialog().querySelectorAll('.dmd-choice input:checked').length!==4)throw Error('默认选择未对应当前结论标签')
+ })
+ await test('两种布局可以切换，并保留同一组材料',async()=>{
+  const count=dialog().querySelectorAll('.dmd-choice input:checked').length
+  button('思维导图').click();await until(()=>dialog().querySelector('svg desc').textContent.includes('思维导图'),'未切换思维导图')
+  button('结构导图').click();await until(()=>dialog().querySelector('svg desc').textContent.includes('结构导图'),'未切换结构导图')
+  if(dialog().querySelectorAll('.dmd-choice input:checked').length!==count)throw Error('切换布局丢失选择')
+ })
+ await test('清空与全选更新预览，空选择不能导出',async()=>{
+  button('清空').click();await until(()=>!dialog().querySelector('.dmd-artboard svg'),'清空后仍显示旧图')
+  if(!button('导出 SVG').disabled||!button('导出 PNG').disabled)throw Error('空图仍能导出')
+  button('全选').click();await until(()=>dialog().querySelector('.dmd-artboard svg'),'全选后未恢复预览')
+  if(dialog().querySelectorAll('.dmd-choice input:checked').length!==10)throw Error('全选未覆盖摘录和结论')
+ })
+ await test('点击 AI 总结才调用模型，返回带来源的归纳',async()=>{
+  button('AI 总结').click();await until(()=>dialog().querySelector('.dmd-settings').textContent.includes('AI 归纳'),'AI 摘要没有出现')
+  if(window.fixtureDiagramRequests.length!==initialRequests+1)throw Error('AI 调用数量异常')
+  if(!dialog().querySelector('svg').textContent.includes('历史定位与恢复'))throw Error('归纳组未进入图中')
+ })
+ await test('更换选择会清除旧归纳，并保持预览可用',async()=>{
+  dialog().querySelector('.dmd-choice input:checked').click()
+  await until(()=>dialog().querySelector('.dmd-settings').textContent.includes('原文整理'),'修改选择后沿用了旧归纳')
+  if(!dialog().querySelector('.dmd-artboard svg'))throw Error('修改选择后预览崩溃')
+ })
+ await test('取消 AI 总结后，迟到结果不会覆盖原文导图',async()=>{
+  diagramBehavior='late';button('AI 总结').click();await until(()=>button('取消总结'),'没有取消入口');button('取消总结').click();await wait(1050)
+  if(!window.fixtureDiagramRequests.at(-1).aborted||dialog().querySelector('.dmd-settings').textContent.includes('AI 归纳'))throw Error('取消后显示迟到归纳')
+  diagramBehavior='normal'
+ })
+ await test('AI 分析中更换材料会终止旧请求',async()=>{
+  diagramBehavior='late';button('AI 总结').click();await until(()=>button('取消总结'),'请求未开始');dialog().querySelector('.dmd-choice input:checked').click();await wait(1050)
+  if(!window.fixtureDiagramRequests.at(-1).aborted||dialog().querySelector('.dmd-settings').textContent.includes('AI 归纳'))throw Error('旧材料的摘要覆盖新材料')
+  diagramBehavior='normal'
+ })
+ await test('Esc 关闭工作台并恢复档案操作',async()=>{
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await until(()=>!dialog(),'Esc 未关闭')
+  if(!document.querySelector('.dpl-root')||document.body.style.overflow==='hidden')throw Error('档案页面被锁定')
+ })
+ await open()
+ document.querySelector('#test-summary').textContent=`${checks.filter(item=>item.ok).length}/${checks.length} 导图检查通过`
+}
+async function runGraphDockTests(){
+ const checks=[]
+ const report=(name,ok,detail='')=>{checks.push({name,ok,detail});document.querySelector('#test-results').textContent=JSON.stringify(checks,null,2)}
+ const test=async(name,fn)=>{try{await fn();report(name,true)}catch(error){report(name,false,String(error))}}
+ const dock=()=>document.querySelector('.dpg-dock')
+ const sheet=()=>document.querySelector('.dpg-sheet')
+ const pointer=(type,target,relatedTarget)=>target.dispatchEvent(new PointerEvent(type,{bubbles:true,pointerType:'mouse',relatedTarget}))
+ const enter=()=>pointer('pointerover',dock(),document.body)
+ const leave=()=>pointer('pointerout',dock(),document.body)
+ await test('默认仅显示底部入口，图谱不占正文高度',async()=>{
+  if(dock().classList.contains('open')||sheet().getAttribute('aria-hidden')!=='true')throw Error('图谱默认展开')
+  if(document.querySelector('.dpl-record-area').getBoundingClientRect().height<300)throw Error('正文被图谱挤压')
+ })
+ await test('档案标题加大到约 22 像素',async()=>{
+  if(parseFloat(getComputedStyle(document.querySelector('.dpl-title')).fontSize)<21)throw Error('标题未加大')
+ })
+ await test('移到底部后向上渐显',async()=>{
+  enter();await until(()=>dock().classList.contains('open'),'悬停没有呼出')
+  await wait(100)
+  const style=getComputedStyle(sheet())
+  if(style.visibility!=='visible'||Number(style.opacity)<=0||!style.transitionTimingFunction.includes('cubic-bezier'))throw Error('缺少上滑渐显过渡')
+  await wait(300)
+  if(Math.abs(new DOMMatrix(getComputedStyle(sheet()).transform).m42)>1)throw Error('图谱未到达展开位置')
+ })
+ await test('移入图谱后保持展开',async()=>{
+  pointer('pointerout',dock(),sheet());pointer('pointerover',sheet(),dock());await wait(650)
+  if(!dock().classList.contains('open'))throw Error('从入口移进图谱时意外收起')
+ })
+ await test('展开后有独立滚动空间，图谱保持在档案边界内',async()=>{
+  const area=sheet(),root=document.querySelector('.dpl-root').getBoundingClientRect(),box=area.getBoundingClientRect()
+  if(getComputedStyle(area).overflowY!=='auto'||area.scrollHeight<=area.clientHeight)throw Error('图谱不能滚动')
+  if(box.top<root.top||box.bottom>root.bottom)throw Error('图谱超出档案窗口')
+  area.scrollTop=70;if(area.scrollTop<1)throw Error('内部滚动没有生效');area.scrollTop=0
+ })
+ await test('移出后延迟收起，并保留淡出动画',async()=>{
+  leave();await until(()=>!dock().classList.contains('open'),'移出后没有收起')
+  if(sheet().getAttribute('aria-hidden')!=='true'||!sheet().inert)throw Error('隐藏图谱仍可聚焦')
+  await wait(420)
+  if(getComputedStyle(sheet()).visibility!=='hidden'||Number(getComputedStyle(sheet()).opacity)!==0)throw Error('退场未完成')
+ })
+ await test('收起按钮不会在焦点返回后立即重开',async()=>{
+  enter();await until(()=>dock().classList.contains('open'),'第二次呼出失败');await wait(400)
+  ;[...dock().querySelectorAll('button')].find(button=>button.textContent==='收起图谱').click();await wait(100)
+  if(dock().classList.contains('open'))throw Error('收起后被焦点重新打开')
+  document.querySelector('#run-graph-dock-tests').focus();leave();await wait(600)
+ })
+ await test('键盘聚焦可展开，Esc 可关闭',async()=>{
+  document.querySelector('.dpg-handle').focus();await until(()=>dock().classList.contains('open'),'键盘聚焦没有展开')
+  document.querySelector('.dpg-handle').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await wait(100)
+  if(dock().classList.contains('open'))throw Error('Esc 未关闭或立即重开')
+  document.querySelector('#run-graph-dock-tests').focus();leave();await wait(600)
+ })
+ // Leave the sheet open for a real wheel check through the browser tools.
+ enter();await until(()=>dock().classList.contains('open'),'最终展开失败');await wait(400)
+ document.querySelector('#test-summary').textContent=`${checks.filter(x=>x.ok).length}/${checks.length} 底部呼出检查通过`
+}
 async function selectClaim(){const calls=window.fixtureTraceCalls;const element=document.querySelector('#claim');const range=document.createRange();range.selectNodeContents(element);const sel=getSelection();sel.removeAllRanges();sel.addRange(range);element.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));await until(()=>window.fixtureTraceCalls>calls&&document.querySelectorAll('.dsp-ev').length===3,'结果未出现')}
 async function demoCancelAnalysis(){
  relatedMode='empty'

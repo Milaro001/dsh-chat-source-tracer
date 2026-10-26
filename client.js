@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
     const SEARCH_ROUTE = '/plugins/dsh-chat-source-tracer/search'
     const RELATED_ROUTE = '/plugins/dsh-chat-source-tracer/related'
     const RELATION_ROUTE = '/plugins/dsh-chat-source-tracer/relationships'
+    const DIAGRAM_ROUTE = '/plugins/dsh-chat-source-tracer/diagram'
     const pendingCrossJump = { value: null }
     const ARM_EVENT = 'dsh-provenance:arm'
     const JUMP_EVENT = 'dsh-provenance:jump-to-source'
@@ -1532,7 +1533,7 @@ window.__ModuleLoader__.load({
     const LEDGER_STYLES = `
       .dpl-root { height: 100%; overflow: auto; padding: 20px 24px 56px; color: var(--dsw-alias-label-primary); font-size: var(--dsp-fs, 13px); line-height: 1.55; }
       .dpl-head { position: relative; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-      .dpl-title { font-size: calc(var(--dsp-fs, 13px) * 1.23); font-weight: 600; color: var(--dsp-accent, inherit); }
+      .dpl-title { font-size: calc(var(--dsp-fs, 13px) * 1.7); line-height: 1.25; font-weight: 650; color: var(--dsp-accent, inherit); }
       .dpl-sub { color: var(--dsw-alias-label-secondary); font-size: calc(var(--dsp-fs, 13px) * 0.92); }
       .dpl-seg { display: inline-flex; border: 1px solid var(--dsw-alias-border-l1); border-radius: 999px; overflow: hidden; }
       .dpl-seg button { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); padding: 4px 10px; font-size: calc(var(--dsp-fs, 13px) * 0.92); cursor: pointer; }
@@ -2449,6 +2450,942 @@ window.__ModuleLoader__.load({
       return words
     }
 
+    /* ------------------------------------------------------- archive graph --- */
+
+    const GRAPH_RECORD_LIMIT = 60
+    const GRAPH_SOURCE_LIMIT = 12
+    const GRAPH_TERM_LIMIT = 18
+    const GRAPH_TEXT_LIMIT = 1600
+    const GRAPH_STOP_WORDS = new Set(('这个 这些 那个 我们 你们 可以 需要 因为 所以 通过 进行 一个 一些 以及 内容 用户 原文 结论 假设 记录 依据 当前 已经 对于 相关 主要 能够 其中 如果 同时 是否 分别 这样 因此 之前 之后 时候 问题 什么 就是 如何 这里 应该 可能 没有 认为 比较 出现 本次 以上 还有 所有 使用 保存 查看 分析 中的 上的 里的 之中 方面 而言 保留 完整 the and for that this with from have has are was were will can should into about not but its our their then than also dsh').split(' '))
+    const graphText = value => String(value || '').replace(/https?:\/\/\S+/g, ' ').replace(/[#*_`>\[\]]/g, '').replace(/\s+/g, ' ').trim()
+    const graphKey = value => graphText(value).toLocaleLowerCase()
+    const graphLabel = (value, length = 16) => {
+      const chars = Array.from(graphText(value))
+      return chars.slice(0, length).join('') + (chars.length > length ? '…' : '')
+    }
+    function graphIdentity(value) {
+      let first = 2166136261, second = 5381
+      for (let i = 0; i < value.length; i++) {
+        first = Math.imul(first ^ value.charCodeAt(i), 16777619)
+        second = Math.imul(second, 33) ^ value.charCodeAt(i)
+      }
+      return `${(first >>> 0).toString(36)}-${(second >>> 0).toString(36)}`
+    }
+
+    function graphTerms(text, keywords = []) {
+      const terms = new Map()
+      const add = (value, explicit = false) => {
+        const label = graphText(value).trim()
+        const key = label.toLocaleLowerCase()
+        if (label.length < 2 || label.length > 24 || GRAPH_STOP_WORDS.has(key)
+          || !/[\p{L}]/u.test(label) || /^\d/.test(label)) return
+        const old = terms.get(key)
+        if (!old || explicit) terms.set(key, { key, label, explicit })
+      }
+      for (const keyword of keywords.slice(0, 24)) if (typeof keyword === 'string') add(keyword, true)
+      const plain = graphText(text)
+      // Sample beginning, middle and end so a long note's final concept is
+      // still eligible, without tokenizing its whole body on every update.
+      const source = plain.length <= GRAPH_TEXT_LIMIT ? plain
+        : [plain.slice(0, 600), plain.slice(Math.floor(plain.length / 2) - 250, Math.floor(plain.length / 2) + 250), plain.slice(-500)].join('\n')
+      if (typeof Intl.Segmenter === 'function') {
+        const segmenter = new Intl.Segmenter('zh', { granularity: 'word' })
+        let previous = null
+        for (const part of segmenter.segment(source)) {
+          if (!part.isWordLike || GRAPH_STOP_WORDS.has(part.segment.toLocaleLowerCase())) { previous = null; continue }
+          add(part.segment)
+          if (previous && /^[\p{Script=Han}]{2,4}$/u.test(previous.segment)
+            && /^[\p{Script=Han}]{2,4}$/u.test(part.segment)
+            && previous.index + previous.segment.length === part.index) add(previous.segment + part.segment)
+          previous = part
+        }
+      } else {
+        for (const token of source.match(/[a-z][a-z0-9-]{2,23}|[\p{Script=Han}]{2,8}/giu) || []) add(token)
+      }
+      return [...terms.values()]
+    }
+
+    /** Bounded, local associations. Only stored provenance creates directed edges. */
+    function buildArchiveGraph({ decisions = [], assumptions = [], notes = [] }) {
+      const records = []
+      for (const [kind, items] of [['decision', decisions], ['assumption', assumptions], ['note', notes]]) {
+        for (const item of items) {
+          if (!item || typeof item.id !== 'string' || (kind === 'decision' && item.status === 'revoked')) continue
+          const text = String(kind === 'decision' ? item.claim || '' : item.text || '')
+          if (!text.trim()) continue
+          records.push({ id: `${kind}:${item.id}`, kind, text, item })
+        }
+      }
+      records.sort((a, b) => (Number(b.item.createdAt) || 0) - (Number(a.item.createdAt) || 0) || a.id.localeCompare(b.id))
+      const shown = records.slice(0, GRAPH_RECORD_LIMIT)
+      const nodes = shown.map(record => ({ ...record, label: graphLabel(record.text, 12), recordIds: [record.id] }))
+      const edges = []
+      const seenEdges = new Set()
+      const addEdge = (source, target, kind, extra = {}) => {
+        const key = `${kind}:${source}:${target}`
+        if (source === target || seenEdges.has(key)) return
+        seenEdges.add(key)
+        edges.push({ id: key, source, target, kind, ...extra })
+      }
+      const terms = new Map()
+      for (const record of shown) {
+        const explicit = record.kind === 'decision'
+          ? (record.item.atoms || []).flatMap(atom => Array.isArray(atom.keywords) ? atom.keywords : []).slice(0, 24) : []
+        const recordTerms = graphTerms(record.text, explicit)
+        for (const term of recordTerms) {
+          if (!terms.has(term.key)) terms.set(term.key, { ...term, recordIds: [], explicitCount: 0 })
+          const found = terms.get(term.key)
+          found.recordIds.push(record.id)
+          if (term.explicit) found.explicitCount++
+        }
+      }
+      const ranked = [...terms.values()].filter(term => term.recordIds.length >= 2 || term.explicitCount)
+        .sort((a, b) => (b.recordIds.length * 3 + b.explicitCount * 8) - (a.recordIds.length * 3 + a.explicitCount * 8)
+          || b.label.length - a.label.length || a.key.localeCompare(b.key))
+      // Prefer "环形索引" over also drawing "环形" and "索引" for the same records.
+      const chosen = []
+      for (const term of ranked) {
+        if (chosen.some(other => other.key.includes(term.key) && term.recordIds.every(id => other.recordIds.includes(id)))) continue
+        chosen.push(term)
+        if (chosen.length === GRAPH_TERM_LIMIT) break
+      }
+      for (const term of chosen) {
+        const id = `topic:${term.key}`
+        nodes.push({ id, kind: 'topic', label: term.label, text: term.label, recordIds: term.recordIds })
+        for (const recordId of term.recordIds) {
+          if (chosen.filter(other => other.recordIds.includes(recordId)).slice(0, 4).includes(term)) addEdge(id, recordId, 'keyword')
+        }
+      }
+      const topicPairs = []
+      for (let i = 0; i < chosen.length; i++) for (let j = i + 1; j < chosen.length; j++) {
+        const shared = chosen[i].recordIds.filter(id => chosen[j].recordIds.includes(id))
+        if (shared.length >= 2) topicPairs.push({ source: `topic:${chosen[i].key}`, target: `topic:${chosen[j].key}`, count: shared.length })
+      }
+      topicPairs.sort((a, b) => b.count - a.count)
+      for (const pair of topicPairs.slice(0, 20)) addEdge(pair.source, pair.target, 'cooccurrence', { count: pair.count })
+
+      const sourceNodes = new Map()
+      for (const record of shown.filter(row => row.kind === 'decision')) {
+        for (const assumption of shown.filter(row => row.kind === 'assumption')) {
+          if (assumption.item.sessionId !== record.item.sessionId) continue
+          if (assumption.item.decisionId === record.item.id
+            || (!assumption.item.decisionId && graphKey(assumption.item.sourceClaim) === graphKey(record.text))) {
+            addEdge(assumption.id, record.id, 'assumption')
+          }
+        }
+        let perDecision = 0
+        for (const atom of record.item.atoms || []) for (const evidence of atom.evidence || []) {
+          if (!evidence || !String(evidence.quote || '').trim() || atom.relation === 'unsupported') continue
+          const sourceSession = evidence.sessionId ?? record.item.sessionId
+          const key = JSON.stringify([sourceSession, evidence.seq, evidence.quote])
+          const note = shown.find(row => row.kind === 'note' && row.item.sessionId === sourceSession
+            && row.item.seq != null && row.item.seq === evidence.seq
+            && graphKey(row.item.quote || row.text) === graphKey(evidence.quote))
+          let node = note || sourceNodes.get(key)
+          if (!node) {
+            if (sourceNodes.size >= GRAPH_SOURCE_LIMIT || perDecision >= 2) continue
+            node = { id: `source:${graphIdentity(key)}`, kind: 'source', text: String(evidence.quote),
+              label: graphLabel(evidence.quote), recordIds: [],
+              item: { ...evidence, sessionId: sourceSession } }
+            sourceNodes.set(key, node)
+            nodes.push(node)
+            perDecision++
+          }
+          const actual = note ? nodes.find(row => row.id === note.id) : node
+          if (!actual.recordIds.includes(record.id)) actual.recordIds.push(record.id)
+          addEdge(actual.id, record.id, 'evidence', { relation: atom.relation })
+        }
+      }
+      const degree = new Map()
+      for (const edge of edges) for (const id of [edge.source, edge.target]) degree.set(id, (degree.get(id) || 0) + 1)
+      for (const node of nodes) node.degree = degree.get(node.id) || 0
+      return { nodes, edges, records: shown, totalRecords: records.length, shownRecords: shown.length }
+    }
+
+    /** Deterministic settling, no perpetual animation or additional dependency. */
+    function layoutArchiveGraph(nodes, edges, width = 760, height = 380) {
+      const positions = new Map()
+      const ordered = [...nodes].sort((a, b) => b.degree - a.degree || a.id.localeCompare(b.id))
+      ordered.forEach((node, index) => {
+        const angle = index * 2.399963
+        const radius = Math.sqrt(index / Math.max(1, nodes.length)) * Math.min(width * .39, height * .36)
+        positions.set(node.id, { x: width / 2 + Math.cos(angle) * radius, y: height / 2 + Math.sin(angle) * radius })
+      })
+      for (let step = 0; step < 130; step++) {
+        const forces = new Map(nodes.map(node => [node.id, { x: 0, y: 0 }]))
+        for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+          const a = positions.get(nodes[i].id), b = positions.get(nodes[j].id)
+          const dx = a.x - b.x || .1, dy = a.y - b.y || .1
+          const distance2 = Math.max(100, dx * dx + dy * dy)
+          const force = 145 / distance2
+          forces.get(nodes[i].id).x += dx * force
+          forces.get(nodes[i].id).y += dy * force
+          forces.get(nodes[j].id).x -= dx * force
+          forces.get(nodes[j].id).y -= dy * force
+        }
+        for (const edge of edges) {
+          const a = positions.get(edge.source), b = positions.get(edge.target)
+          if (!a || !b) continue
+          const dx = b.x - a.x, dy = b.y - a.y
+          const distance = Math.max(1, Math.hypot(dx, dy))
+          const pull = (distance - (edge.kind === 'cooccurrence' ? 125 : 95)) * .055
+          forces.get(edge.source).x += dx / distance * pull
+          forces.get(edge.source).y += dy / distance * pull
+          forces.get(edge.target).x -= dx / distance * pull
+          forces.get(edge.target).y -= dy / distance * pull
+        }
+        for (const node of nodes) {
+          const point = positions.get(node.id), force = forces.get(node.id)
+          const cooling = 1 - step / 150
+          point.x = Math.max(62, Math.min(width - 62, point.x + Math.max(-7, Math.min(7, force.x + (width / 2 - point.x) * .022)) * cooling))
+          point.y = Math.max(30, Math.min(height - 38, point.y + Math.max(-7, Math.min(7, force.y + (height / 2 - point.y) * .022)) * cooling))
+        }
+      }
+      return positions
+    }
+
+    const GRAPH_STYLES = `
+      .dpg-root { container-type: inline-size; margin-top: 22px; max-width: 1120px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 16px; overflow: hidden; background: var(--dsw-alias-bg-layer-1); }
+      .dpg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 16px 10px; }
+      .dpg-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
+      .dpg-title::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--dsp-accent, #7e9fff); box-shadow: 0 0 12px var(--dsp-accent-soft, #7e9fff33); }
+      .dpg-caption, .dpg-foot { color: var(--dsw-alias-label-secondary); font-size: 11px; }
+      .dpg-controls, .dpg-legend { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .dpg-controls .dpl-btn { font-size: 12px; }
+      .dpg-legend { padding: 0 16px 12px; gap: 14px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
+      .dpg-key { display: inline-flex; align-items: center; gap: 5px; }
+      .dpg-key i { width: 6px; height: 6px; border-radius: 50%; background: var(--dpg-color); }
+      .dpg-body { display: grid; grid-template-columns: minmax(0, 1fr) 244px; min-height: 365px; border-top: 1px solid var(--dsw-alias-border-l1); }
+      .dpg-canvas { position: relative; min-width: 0; height: 365px; background: radial-gradient(ellipse at 48% 46%, var(--dsp-accent-soft, #4f8cff12), transparent 68%), var(--dsw-alias-bg-base); overflow: hidden; }
+      .dpg-root.large .dpg-canvas { height: min(66vh, 640px); min-height: 365px; }
+      .dpg-canvas svg { display: block; width: 100%; height: 100%; touch-action: none; user-select: none; cursor: grab; }
+      .dpg-canvas svg:active { cursor: grabbing; }
+      .dpg-edge { stroke: var(--dsw-alias-label-secondary); stroke-opacity: .19; stroke-width: 1; transition: stroke-opacity .16s; pointer-events: none; }
+      .dpg-edge.keyword, .dpg-edge.cooccurrence { stroke-dasharray: 3 5; stroke-opacity: .14; }
+      .dpg-edge.hot { stroke: var(--dsp-accent, #7e9fff); stroke-opacity: .75; stroke-width: 1.4; }
+      .dpg-edge.faint { stroke-opacity: .045; }
+      .dpg-node { cursor: pointer; outline: none; opacity: 1; transition: opacity .16s; }
+      .dpg-node.faint { opacity: .2; }
+      .dpg-node circle { fill: var(--dpg-color); stroke: var(--dsw-alias-bg-layer-1); stroke-width: 1.7; }
+      .dpg-node.selected circle, .dpg-node:focus-visible circle { stroke: var(--dsp-accent, #7e9fff); stroke-width: 3; filter: drop-shadow(0 0 6px var(--dsp-accent-soft, #7e9fff55)); }
+      .dpg-node text { fill: var(--dsw-alias-label-primary); font-family: inherit; font-size: 11px; paint-order: stroke; stroke: var(--dsw-alias-bg-base); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
+      .dpg-node.selected text { font-weight: 600; }
+      .dpg-zoom { position: absolute; bottom: 10px; left: 12px; display: flex; align-items: center; gap: 4px; padding: 3px; background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l1); border-radius: 9px; }
+      .dpg-zoom button { width: 28px; height: 26px; padding: 0; }
+      .dpg-zoom span { min-width: 42px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 11px; }
+      .dpg-detail { padding: 14px; border-left: 1px solid var(--dsw-alias-border-l1); max-height: 365px; overflow: auto; }
+      .dpg-root.large .dpg-detail { max-height: min(66vh, 640px); }
+      .dpg-detail h4 { margin: 8px 0; font-size: 14px; overflow-wrap: anywhere; }
+      .dpg-kind { color: var(--dpg-color); font-size: 11px; }
+      .dpg-detail p { margin: 6px 0 12px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
+      .dpg-record { display: block; width: 100%; text-align: left; border: 1px solid var(--dsw-alias-border-l1); border-radius: 9px; padding: 8px 9px; background: transparent; color: inherit; cursor: pointer; margin-top: 7px; }
+      .dpg-record:hover, .dpg-record:focus-visible { border-color: var(--dsp-accent, #7e9fff); background: var(--dsp-accent-soft); }
+      .dpg-record small { display: block; color: var(--dsw-alias-label-secondary); font-size: 10px; margin-bottom: 3px; }
+      .dpg-record span { font-size: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+      .dpg-foot { padding: 9px 16px; border-top: 1px solid var(--dsw-alias-border-l1); }
+      .dpg-empty { min-height: 180px; display: grid; place-content: center; text-align: center; padding: 24px; color: var(--dsw-alias-label-secondary); }
+      .dpg-empty b { color: var(--dsw-alias-label-primary); margin-bottom: 6px; font-weight: 500; }
+      .dpl-root { position: relative; display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; padding-bottom: 62px; }
+      .dpl-head, .dpl-stats, .dpl-tabs, .dpl-notice { flex-shrink: 0; }
+      .dpl-record-area { flex: 1; min-height: 0; overflow: auto; padding: 1px 3px 12px 1px; }
+      .dpg-dock { position: absolute; z-index: 5; left: 24px; right: 24px; bottom: 14px; height: 30px; display: flex; justify-content: center; }
+      .dpg-dock.open::before { content: ''; position: absolute; left: 0; right: 0; bottom: 26px; height: 18px; }
+      .dpg-handle { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 5px 16px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 999px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-1); font: inherit; font-size: 12px; cursor: pointer; transition: color .2s ease, border-color .2s ease, background .2s ease; }
+      .dpg-handle svg { width: 20px; height: 14px; flex: 0 0 auto; }
+      .dpg-handle small { font-size: 10px; opacity: .65; }
+      .dpg-handle:hover, .dpg-handle:focus-visible, .dpg-dock.open .dpg-handle { color: var(--dsp-accent, #659ce8); border-color: var(--dsp-accent-soft); background: var(--dsw-alias-bg-layer-2); }
+      .dpg-sheet { position: absolute; left: 0; right: 0; bottom: 38px; max-height: min(520px, calc(var(--dpg-space, 600px) * .7)); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; border: 1px solid var(--dsw-alias-border-l2); border-radius: 16px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 -10px 38px rgba(0,0,0,.13); opacity: 0; visibility: hidden; pointer-events: none; transform: translateY(calc(100% + 52px)); transition: transform .36s cubic-bezier(.22,1,.36,1), opacity .24s ease, visibility 0s linear .36s; }
+      .dpg-dock.open .dpg-sheet { opacity: 1; visibility: visible; pointer-events: auto; transform: translateY(0); transition-delay: 0s; }
+      .dpg-sheet .dpg-root { margin: 0; max-width: none; border: 0; border-radius: 0; overflow: visible; }
+      .dpg-sheet .dpg-head { position: sticky; top: 0; z-index: 2; background: var(--dsw-alias-bg-layer-1); }
+      .dpl-card[data-graph-focus="true"], .dpl-asm-row[data-graph-focus="true"] { border-color: var(--dsp-accent); box-shadow: 0 0 0 2px var(--dsp-accent-soft); }
+      @container (max-width: 620px) { .dpg-body { grid-template-columns: 1fr; } .dpg-detail { max-height: 210px; border-left: 0; border-top: 1px solid var(--dsw-alias-border-l1); } .dpg-root.large .dpg-detail { max-height: 260px; } }
+      @media (prefers-reduced-motion: reduce) { .dpg-edge, .dpg-node, .dpg-sheet, .dpg-handle { transition: none; } }
+    `
+
+    /** A bottom edge trigger reveals a contained, independently scrollable sheet. */
+    function ArchiveGraphDock({ graph, en, onReveal, archiveRootRef }) {
+      const t = (zh, english) => en ? english : zh
+      const [visible, setVisible] = React.useState(false)
+      const [mounted, setMounted] = React.useState(false)
+      const [space, setSpace] = React.useState(600)
+      const dockRef = React.useRef(null)
+      const handleRef = React.useRef(null)
+      const visibleRef = React.useRef(false)
+      const insideRef = React.useRef(false)
+      const suppressedRef = React.useRef(false)
+      const openTimer = React.useRef(null)
+      const closeTimer = React.useRef(null)
+      const pointerOpenState = React.useRef(null)
+      const clearTimers = () => { window.clearTimeout(openTimer.current); window.clearTimeout(closeTimer.current) }
+      const show = () => {
+        clearTimers()
+        setMounted(true)
+        visibleRef.current = true
+        setVisible(true)
+      }
+      const hide = (restoreFocus = false) => {
+        clearTimers()
+        suppressedRef.current = restoreFocus || insideRef.current
+        visibleRef.current = false
+        setVisible(false)
+        if (restoreFocus) handleRef.current?.focus({ preventScroll: true })
+      }
+      const scheduleHide = () => {
+        window.clearTimeout(closeTimer.current)
+        closeTimer.current = window.setTimeout(() => {
+          if (insideRef.current || dockRef.current?.contains(document.activeElement)) return
+          hide()
+        }, 550)
+      }
+      React.useEffect(() => () => clearTimers(), [])
+      React.useEffect(() => {
+        const root = archiveRootRef.current
+        if (!root) return undefined
+        const measure = () => setSpace(Math.max(180, root.clientHeight))
+        measure()
+        if (typeof ResizeObserver === 'undefined') return undefined
+        const observer = new ResizeObserver(measure)
+        observer.observe(root)
+        return () => observer.disconnect()
+      }, [archiveRootRef])
+      React.useEffect(() => {
+        if (!visible) return undefined
+        const outside = event => {
+          if (!dockRef.current?.contains(event.target)) hide()
+        }
+        document.addEventListener('pointerdown', outside, true)
+        return () => document.removeEventListener('pointerdown', outside, true)
+      }, [visible])
+      return h('div', { className: 'dpg-dock' + (visible ? ' open' : ''), ref: dockRef,
+        style: { '--dpg-space': `${space}px` },
+        onPointerEnter: event => {
+          if (event.pointerType === 'touch') return
+          insideRef.current = true
+          window.clearTimeout(closeTimer.current)
+          if (!suppressedRef.current && !visibleRef.current) openTimer.current = window.setTimeout(show, 130)
+        },
+        onPointerLeave: event => {
+          if (event.pointerType === 'touch') return
+          insideRef.current = false
+          suppressedRef.current = false
+          window.clearTimeout(openTimer.current)
+          scheduleHide()
+        },
+        onFocus: () => { if (!suppressedRef.current) show() },
+        onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) scheduleHide() },
+        onKeyDown: event => { if (event.key === 'Escape' && visibleRef.current) { event.stopPropagation(); event.preventDefault(); suppressedRef.current = true; hide(true) } },
+      },
+        h('div', { className: 'dpg-sheet', 'aria-hidden': !visible, inert: !visible ? true : undefined },
+          mounted ? h(ArchiveGraph, { graph, en, onDismiss: () => hide(true), onReveal: record => { hide(); onReveal(record) } }) : null),
+        h('button', { ref: handleRef, type: 'button', className: 'dpg-handle', 'aria-expanded': visible,
+          'aria-label': t('关系图谱', 'Relationship graph'),
+          title: t('移到这里展开；也可点击或用键盘打开', 'Hover to reveal, or open with a click or keyboard'),
+          onPointerDown: () => { pointerOpenState.current = visibleRef.current },
+          onClick: () => {
+            const wasOpen = pointerOpenState.current ?? visibleRef.current
+            pointerOpenState.current = null
+            if (wasOpen) { suppressedRef.current = true; hide() } else { suppressedRef.current = false; show() }
+          } },
+          h('svg', { viewBox: '0 0 24 16', fill: 'none', 'aria-hidden': true },
+            h('path', { d: 'M4 12 12 4 20 12', stroke: 'currentColor', strokeWidth: 1, opacity: .65 }),
+            ...[[4,12],[12,4],[20,12]].map(([cx,cy]) => h('circle', { key: cx, cx, cy, r: 2.3, fill: 'currentColor' }))),
+          t('关系图谱', 'Relationship graph'), h('small', { 'aria-hidden': true }, visible ? '⌄' : '⌃')))
+    }
+
+    function ArchiveGraph({ graph, en, onReveal, onDismiss }) {
+      const t = (zh, english) => en ? english : zh
+      const colors = { topic: '#a78bfa', decision: '#659ce8', assumption: '#d6a658', note: '#94a3b8', source: '#55aaa3' }
+      const kindName = kind => ({ topic: t('概念', 'Concept'), decision: t('结论', 'Conclusion'), assumption: t('假设', 'Assumption'), note: t('摘录', 'Note'), source: t('依据原文', 'Source') })[kind]
+      const [selectedId, setSelectedId] = React.useState(null)
+      const [hoverId, setHoverId] = React.useState(null)
+      const [large, setLarge] = React.useState(false)
+      const [open, setOpen] = React.useState(true)
+      const [size, setSize] = React.useState({ width: 700, height: 365 })
+      const [view, setView] = React.useState({ x: 0, y: 0, scale: 1 })
+      const [moved, setMoved] = React.useState({})
+      const canvasRef = React.useRef(null)
+      const svgRef = React.useRef(null)
+      const dragRef = React.useRef(null)
+      const suppressClick = React.useRef(false)
+      const settled = React.useMemo(() => layoutArchiveGraph(graph.nodes, graph.edges, size.width, size.height), [graph, size])
+      React.useEffect(() => {
+        setMoved({})
+        setView({ x: 0, y: 0, scale: 1 })
+        setSelectedId(id => graph.nodes.some(node => node.id === id) ? id
+          : [...graph.nodes].filter(node => node.kind === 'topic').sort((a, b) => b.degree - a.degree)[0]?.id || null)
+      }, [graph])
+      React.useEffect(() => {
+        const canvas = canvasRef.current
+        if (!canvas) return undefined
+        const measure = () => {
+          const box = canvas.getBoundingClientRect()
+          if (box.width > 0 && box.height > 0) setSize(old => Math.abs(old.width - box.width) < 1 && Math.abs(old.height - box.height) < 1
+            ? old : { width: box.width, height: box.height })
+        }
+        measure()
+        if (typeof ResizeObserver === 'undefined') return undefined
+        const observer = new ResizeObserver(measure)
+        observer.observe(canvas)
+        return () => observer.disconnect()
+      }, [open, large, graph.nodes.length > 0])
+      const zoom = (factor, anchor = { x: size.width / 2, y: size.height / 2 }) => setView(old => {
+        const scale = Math.max(.45, Math.min(2.8, old.scale * factor))
+        return { scale, x: anchor.x - (anchor.x - old.x) * scale / old.scale, y: anchor.y - (anchor.y - old.y) * scale / old.scale }
+      })
+      React.useEffect(() => {
+        const svg = svgRef.current
+        if (!svg) return undefined
+        const wheel = event => {
+          if (!event.ctrlKey && !event.metaKey) return
+          event.preventDefault()
+          const box = svg.getBoundingClientRect()
+          zoom(event.deltaY > 0 ? .9 : 1.1, { x: event.clientX - box.left, y: event.clientY - box.top })
+        }
+        svg.addEventListener('wheel', wheel, { passive: false })
+        return () => svg.removeEventListener('wheel', wheel)
+      }, [open, graph.nodes.length > 0])
+      const point = nodeId => moved[nodeId] || settled.get(nodeId)
+      const activeId = hoverId || selectedId
+      const neighborhood = new Set(activeId ? [activeId] : [])
+      for (const edge of graph.edges) if (edge.source === activeId || edge.target === activeId) { neighborhood.add(edge.source); neighborhood.add(edge.target) }
+      const labels = new Map()
+      const labelBoxes = []
+      const priority = node => node.id === activeId ? 100 : neighborhood.has(node.id) ? 50 : node.kind === 'topic' ? 20 : 0
+      for (const node of [...graph.nodes].sort((a, b) => priority(b) - priority(a) || b.degree - a.degree)) {
+        if (activeId && !neighborhood.has(node.id) && node.kind !== 'topic') continue
+        const position = point(node.id)
+        const width = Math.min(178, Array.from(node.label).reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 11 : 6), 8))
+        for (const y of [25, -18]) {
+          const box = { left: position.x - width / 2, right: position.x + width / 2, top: position.y + y - 11, bottom: position.y + y + 4 }
+          if (node.id !== activeId && labelBoxes.some(other => box.left < other.right && box.right > other.left && box.top < other.bottom && box.bottom > other.top)) continue
+          labels.set(node.id, y)
+          labelBoxes.push(box)
+          break
+        }
+      }
+      const selected = graph.nodes.find(node => node.id === selectedId)
+      const selectedRecords = new Set(selected?.recordIds || [])
+      if (selected && selected.kind !== 'topic') for (const edge of graph.edges) {
+        if (!['evidence', 'assumption'].includes(edge.kind)) continue
+        const neighborId = edge.source === selected.id ? edge.target : edge.target === selected.id ? edge.source : null
+        const neighbor = graph.nodes.find(node => node.id === neighborId)
+        for (const recordId of neighbor?.recordIds || []) selectedRecords.add(recordId)
+      }
+      const related = graph.records.filter(record => selectedRecords.has(record.id))
+      const jumpTarget = selected?.kind === 'source' || (selected?.kind === 'note' && selected.item.seq != null)
+        ? { quote: selected.kind === 'note' ? noteJumpText(selected.item) : selected.text, seq: selected.item.seq, sessionId: selected.item.sessionId }
+        : selected?.kind === 'decision' && selected.item.claimSeq != null
+          ? { quote: selected.text, seq: selected.item.claimSeq, sessionId: selected.item.sessionId } : null
+      const start = (event, nodeId = null) => {
+        if (event.button !== 0) return
+        event.preventDefault()
+        event.stopPropagation()
+        suppressClick.current = false
+        dragRef.current = { id: nodeId, pointerId: event.pointerId, x: event.clientX, y: event.clientY, view, point: nodeId ? point(nodeId) : null }
+        svgRef.current?.setPointerCapture(event.pointerId)
+      }
+      const move = event => {
+        const drag = dragRef.current
+        if (!drag || drag.pointerId !== event.pointerId) return
+        const dx = event.clientX - drag.x, dy = event.clientY - drag.y
+        if (Math.hypot(dx, dy) > 4) suppressClick.current = true
+        if (!suppressClick.current) return
+        if (drag.id) setMoved(old => ({ ...old, [drag.id]: { x: drag.point.x + dx / drag.view.scale, y: drag.point.y + dy / drag.view.scale } }))
+        else setView({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy })
+      }
+      const finish = event => {
+        const drag = dragRef.current
+        if (drag?.pointerId !== event.pointerId) return
+        if (event.type !== 'pointercancel' && drag.id && !suppressClick.current) setSelectedId(drag.id)
+        suppressClick.current = suppressClick.current || Boolean(drag.id)
+        dragRef.current = null
+        if (svgRef.current?.hasPointerCapture(event.pointerId)) svgRef.current.releasePointerCapture(event.pointerId)
+      }
+      const reset = () => { setView({ x: 0, y: 0, scale: 1 }); setMoved({}); setSelectedId(null); setHoverId(null) }
+      const edgeTitle = edge => edge.kind === 'assumption' ? t('结论依赖的已保存假设', 'Saved premise of the conclusion')
+        : edge.kind === 'evidence' ? t('已保存的溯源关系：', 'Saved source relationship: ') + relationLabel(edge.relation, t)
+        : edge.kind === 'cooccurrence' ? t(`共同出现在 ${edge.count} 条档案中`, `Co-occurs in ${edge.count} records`) : t('包含共同关键词', 'Shared keyword')
+      return h('section', { className: 'dpg-root' + (large ? ' large' : ''), 'aria-label': t('档案关系图谱', 'Archive relationship graph') },
+        h('div', { className: 'dpg-head' },
+          h('div', null, h('div', { className: 'dpg-title' }, t('关系图谱', 'Relationship graph')),
+            h('div', { className: 'dpg-caption' }, t('从一个概念，找到相连的观点与原文。', 'Follow a concept to its connected ideas and sources.'))),
+          h('div', { className: 'dpg-controls' },
+            open && graph.nodes.length ? h('button', { type: 'button', className: 'dpl-btn', onClick: () => setLarge(value => !value), 'aria-pressed': large }, large ? t('缩小视图', 'Compact view') : t('放大视图', 'Expand view')) : null,
+            h('button', { type: 'button', className: 'dpl-btn', onClick: onDismiss || (() => setOpen(value => !value)), 'aria-expanded': open }, open ? t('收起图谱', 'Hide graph') : t('展开图谱', 'Show graph')))),
+        open ? h(React.Fragment, null,
+          h('div', { className: 'dpg-legend' }, ...['topic', 'decision', 'assumption', 'note', 'source'].map(kind => h('span', { key: kind, className: 'dpg-key', style: { '--dpg-color': colors[kind] } }, h('i'), kindName(kind)))),
+          graph.nodes.length ? h('div', { className: 'dpg-body' },
+            h('div', { className: 'dpg-canvas', ref: canvasRef },
+              h('svg', { ref: svgRef, role: 'group', 'aria-label': t('可拖动的概念与档案节点', 'Draggable concept and archive nodes'),
+                viewBox: `0 0 ${size.width} ${size.height}`, onPointerDown: event => start(event), onPointerMove: move, onPointerUp: finish, onPointerCancel: finish,
+                onLostPointerCapture: () => { dragRef.current = null }, onClick: () => { if (!suppressClick.current) setSelectedId(null) } },
+                h('g', { transform: `translate(${view.x} ${view.y}) scale(${view.scale})` },
+                  ...graph.edges.map(edge => {
+                    const a = point(edge.source), b = point(edge.target)
+                    const hot = activeId && (edge.source === activeId || edge.target === activeId)
+                    const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy) || 1
+                    const endX = b.x - dx / length * 12, endY = b.y - dy / length * 12
+                    return h('g', { key: edge.id, 'aria-hidden': true },
+                      h('line', { x1: a.x, y1: a.y, x2: endX, y2: endY, className: `dpg-edge ${edge.kind}${hot ? ' hot' : activeId ? ' faint' : ''}` }, h('title', null, edgeTitle(edge))),
+                      ['evidence', 'assumption'].includes(edge.kind) ? h('path', {
+                        d: `M ${endX - dx / length * 5 - dy / length * 3} ${endY - dy / length * 5 + dx / length * 3} L ${endX} ${endY} L ${endX - dx / length * 5 + dy / length * 3} ${endY - dy / length * 5 - dx / length * 3}`,
+                        className: `dpg-edge${hot ? ' hot' : activeId ? ' faint' : ''}`, fill: 'none',
+                      }) : null)
+                  }),
+                  ...graph.nodes.map(node => {
+                    const p = point(node.id)
+                    const select = event => { event.stopPropagation(); if (!suppressClick.current) setSelectedId(node.id) }
+                    return h('g', { key: node.id, role: 'button', tabIndex: 0, 'aria-label': `${kindName(node.kind)}：${node.text}`, 'aria-pressed': selectedId === node.id,
+                      'data-graph-node': node.id, className: `dpg-node${selectedId === node.id ? ' selected' : ''}${activeId && !neighborhood.has(node.id) ? ' faint' : ''}`,
+                      style: { '--dpg-color': colors[node.kind] }, transform: `translate(${p.x} ${p.y})`, onClick: select,
+                      onPointerDown: event => start(event, node.id), onPointerEnter: () => setHoverId(node.id), onPointerLeave: () => setHoverId(null),
+                      onFocus: () => setHoverId(node.id), onBlur: () => setHoverId(null),
+                      onKeyDown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedId(node.id) } } },
+                      h('title', null, `${kindName(node.kind)} · ${node.text}`),
+                      h('circle', { r: 16, style: { fill: 'transparent', stroke: 'none' } }),
+                      h('circle', { r: node.kind === 'topic' ? Math.min(13, 7 + node.recordIds.length) : Math.min(10, 4 + Math.sqrt(node.degree)) }),
+                      labels.has(node.id) ? h('text', { y: labels.get(node.id), textAnchor: 'middle' }, node.label) : null)
+                  }))),
+              h('div', { className: 'dpg-zoom' },
+                h('button', { type: 'button', className: 'dpl-btn', onClick: () => zoom(.8), 'aria-label': t('缩小图谱', 'Zoom out') }, '−'),
+                h('span', null, `${Math.round(view.scale * 100)}%`),
+                h('button', { type: 'button', className: 'dpl-btn', onClick: () => zoom(1.25), 'aria-label': t('放大图谱', 'Zoom in') }, '+'),
+                h('button', { type: 'button', className: 'dpl-btn', onClick: reset, 'aria-label': t('重置图谱视图', 'Reset graph view'), title: t('重置视图', 'Reset view') }, '↺'))),
+            h('aside', { className: 'dpg-detail', 'aria-live': 'polite' },
+              selected ? h(React.Fragment, null,
+                h('span', { className: 'dpg-kind', style: { '--dpg-color': colors[selected.kind] } }, kindName(selected.kind)),
+                h('h4', null, selected.kind === 'topic' ? selected.text : graphLabel(selected.text, 34)),
+                selected.kind !== 'topic' ? h(CollapsibleText, { text: selected.text, en, variant: 'record' }) : null,
+                h('p', null, t(`关联 ${related.length} 条档案。点击条目可查看。`, `${related.length} connected records. Open a record to inspect it.`)),
+                ...related.map(record => h('button', { key: record.id, type: 'button', className: 'dpg-record', onClick: () => onReveal(record) },
+                  h('small', null, `${kindName(record.kind)} · ${compactDate(record.item.createdAt, en)}`), h('span', null, record.text))),
+                jumpTarget ? h('button', { type: 'button', className: 'dpl-btn', 'data-dsp-jump': '', style: { marginTop: '10px' },
+                  onClick: () => window.dispatchEvent(new CustomEvent(JUMP_EVENT, { detail: { ...jumpTarget, addressed: true } })) }, t('跳转原文', 'Jump to source')) : null,
+              ) : h(React.Fragment, null, h('h4', null, t('点亮一个概念', 'Choose a concept')),
+                h('p', null, t('点击圆点，查看相邻概念、关联档案与来源。也可以拖动圆点，整理眼前的关系。', 'Select a node to inspect its neighbors, records and sources. Drag nodes to arrange the view.')),
+                h('p', null, t('实线箭头：已存档的依据或依赖假设。虚线：共同关键词或概念共现，供探索关联。', 'Arrows: saved source or premise relationships. Dashed lines: shared keywords or co-occurring concepts.')))))
+          : h('div', { className: 'dpg-empty' },
+              h('b', null, graph.totalRecords ? t('当前筛选没有可显示的节点', 'No nodes in this selection') : t('保存一些观点，关系会在这里生长', 'Save ideas to start your graph')),
+              h('span', null, t('存档结论、假设或摘录后自动生成，也可以切换到「全部会话」。', 'Save conclusions, assumptions or notes, or switch to All sessions.'))),
+          h('div', { className: 'dpg-foot' }, t(
+            `本地生成 · ${graph.shownRecords}/${graph.totalRecords} 条档案 · 虚线关联不代表证据。拖动空白平移，Ctrl/⌘ + 滚轮缩放。${graph.totalRecords > graph.shownRecords ? '当前显示最近 60 条，可用上方搜索缩小范围。' : ''}`,
+            `Local graph · ${graph.shownRecords}/${graph.totalRecords} records · Dashed links are associations, not evidence. Drag to pan; Ctrl/⌘ + wheel to zoom.${graph.totalRecords > graph.shownRecords ? ' Showing the latest 60 records; use archive search to narrow the scope.' : ''}`))) : null)
+    }
+
+    /* -------------------------------------------------------- diagram export --- */
+
+    const DIAGRAM_MAX_RECORDS = 20
+    const DIAGRAM_MAX_CHARS = 24000
+    const diagramPlain = value => String(value || '').replace(/[#*_`>\[\]]/g, '').replace(/\s+/g, ' ').trim()
+    const diagramXml = value => String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g, '')
+      .replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char])
+
+    function diagramLines(value, columns = 30, maxLines = 8) {
+      const chars = Array.from(diagramPlain(value))
+      const lines = []
+      let line = '', width = 0
+      for (let i = 0; i < chars.length; i++) {
+        const char = chars[i], advance = /[MW@#%&]/.test(char) ? 1 : /[A-Zmw]/.test(char) ? .82 : /[\x00-\xff]/.test(char) ? .65 : 1
+        if (width + advance > columns && line) {
+          lines.push(line.trim())
+          if (lines.length === maxLines) { lines[maxLines - 1] = lines[maxLines - 1].replace(/.$/u, '') + '…'; return lines }
+          line = ''; width = 0
+        }
+        line += char; width += advance
+      }
+      if (line.trim()) lines.push(line.trim())
+      return lines
+    }
+
+    function localDiagramGroups(records, en) {
+      const candidates = new Map()
+      const words = new Map()
+      for (const record of records) {
+        const explicit = record.kind === 'decision' ? (record.item.atoms || []).flatMap(atom => atom.keywords || []) : []
+        const terms = graphTerms(record.text, explicit)
+        words.set(record.id, new Set(terms.map(term => term.key)))
+        for (const term of terms) {
+          if (!candidates.has(term.key)) candidates.set(term.key, { ...term, count: 0, score: 0 })
+          const candidate = candidates.get(term.key)
+          candidate.count++; candidate.score += term.explicit ? 5 : 1
+        }
+      }
+      const topics = [...candidates.values()].filter(term => term.count >= 2)
+        .sort((a, b) => b.score - a.score || b.label.length - a.label.length).slice(0, 5)
+      const groups = new Map()
+      for (const record of records) {
+        const topic = topics.find(term => words.get(record.id).has(term.key))
+        const key = topic?.key || record.kind
+        if (!groups.has(key)) groups.set(key, { id: `group-${groups.size + 1}`,
+          title: topic?.label || (record.kind === 'note' ? (en ? 'Saved excerpts' : '摘录材料') : (en ? 'Saved conclusions' : '存档结论')),
+          summary: '', recordIds: [] })
+        groups.get(key).recordIds.push(record.id)
+      }
+      return [...groups.values()].map(group => ({ ...group, summary: en
+        ? `${group.recordIds.length} selected records, organized by shared terms or record type.`
+        : `按共同词或记录类型整理的 ${group.recordIds.length} 条选中材料。` }))
+    }
+
+    function checkedDiagramGroups(raw, records) {
+      const ids = new Set(records.map(record => record.id)), seen = new Set()
+      if (!Array.isArray(raw) || !raw.length || raw.length > 7) throw new Error('Invalid diagram groups')
+      const groups = raw.map((group, index) => {
+        if (!group || typeof group.title !== 'string' || !group.title.trim() || group.title.length > 80
+          || typeof group.summary !== 'string' || group.summary.length > 600 || !Array.isArray(group.recordIds) || !group.recordIds.length) throw new Error('Invalid diagram group')
+        const recordIds = [...new Set(group.recordIds)]
+        for (const id of recordIds) { if (!ids.has(id) || seen.has(id)) throw new Error('Invalid diagram source'); seen.add(id) }
+        return { id: `group-${index + 1}`, title: group.title, summary: group.summary, recordIds }
+      })
+      if (seen.size !== ids.size) throw new Error('Missing diagram source')
+      return groups
+    }
+
+    /** Both layouts preserve the same selected records and source references. */
+    function buildArchiveDiagram(records, { layout = 'mind', title = '', en = false, groups: supplied, ai = false, includeSources = true } = {}) {
+      if (!records.length || records.length > DIAGRAM_MAX_RECORDS) throw new Error('Select 1–20 records')
+      const groups = supplied ? checkedDiagramGroups(supplied, records) : localDiagramGroups(records, en)
+      const text = (zh, english) => en ? english : zh
+      const nodes = [], edges = []
+      const card = (id, kind, label, heading, body, recordId = null, width = 280) => {
+        const titleLines = diagramLines(heading, Math.floor((width - 32) / (kind === 'root' ? 18 : 14)), 2)
+        const bodyLines = diagramLines(body, Math.floor((width - 32) / 12), ['synthesis', 'group'].includes(kind) ? 12 : ['note', 'decision'].includes(kind) ? 9 : 7)
+        return { id, kind, label, titleLines, bodyLines, recordId, width,
+          height: 52 + titleLines.length * 20 + bodyLines.length * 18 + 16, x: 0, y: 0 }
+      }
+      const numbers = new Map(records.map((record, index) => [record.id, `${record.kind === 'note' ? 'N' : 'C'}${String(index + 1).padStart(2, '0')}`]))
+      const mapping = new Map(records.map(record => [record.id, record]))
+      const slots = []
+      for (const group of groups) {
+        const groupCard = card(group.id, ai ? 'synthesis' : 'group', ai ? text('AI 归纳 · 待核对', 'AI synthesis · review') : text('主题整理', 'Topic group'), group.title, group.summary)
+        const members = group.recordIds.map(id => {
+          const record = mapping.get(id)
+          const node = card(`record:${id}`, record.kind === 'note' ? 'note' : 'decision',
+            `${record.kind === 'note' ? text('摘录', 'Excerpt') : text('结论', 'Conclusion')} ${numbers.get(id)}`,
+            '', record.text, id, 310)
+          const leaves = []
+          if (includeSources && record.kind === 'decision') {
+            const seen = new Set()
+            for (const atom of record.item.atoms || []) for (const evidence of atom.evidence || []) {
+              if (!evidence?.quote || atom.relation === 'unsupported' || leaves.length >= 2) continue
+              const key = JSON.stringify([evidence.sessionId || record.item.sessionId, evidence.seq, evidence.quote])
+              if (seen.has(key)) continue
+              seen.add(key)
+              const leaf = card(`evidence:${id}:${leaves.length}`, 'source', text('已存依据', 'Saved source'),
+                relationLabel(atom.relation, text), evidence.quote, id, 270)
+              leaves.push(leaf)
+              edges.push({ source: leaf.id, target: node.id, kind: 'source' })
+            }
+            for (const assumption of (record.item.assumptions || []).slice(0, 2)) {
+              const leaf = card(`premise:${id}:${leaves.length}`, 'assumption', text('待核对前提', 'Premise to review'),
+                text('依赖假设', 'Assumption'), assumption, id, 270)
+              leaves.push(leaf)
+              edges.push({ source: leaf.id, target: node.id, kind: 'assumption' })
+            }
+          }
+          const leavesHeight = leaves.reduce((sum, leaf) => sum + leaf.height + 20, 0) - (leaves.length ? 20 : 0)
+          return { node, leaves, height: Math.max(node.height, leavesHeight) + 30 }
+        })
+        slots.push({ groupCard, members, height: Math.max(groupCard.height + 30, members.reduce((sum, member) => sum + member.height, 0)) })
+      }
+      const total = slots.reduce((sum, slot) => sum + slot.height + 44, 0)
+      const sourceColumn = includeSources && slots.some(slot => slot.members.some(member => member.leaves.length))
+      const positions = layout === 'structure' ? { group: sourceColumn ? 1130 : 760, record: sourceColumn ? 775 : 390, leaf: 390 }
+        : { group: 390, record: 760, leaf: 1150 }
+      const root = card('root', 'root', text('导图主题', 'Main topic'), title || text('摘录与结论', 'Excerpts and conclusions'),
+        text(`${records.filter(record => record.kind === 'note').length} 条摘录 · ${records.filter(record => record.kind === 'decision').length} 条结论`,
+          `${records.filter(record => record.kind === 'note').length} excerpts · ${records.filter(record => record.kind === 'decision').length} conclusions`), null, 260)
+      root.x = 48; root.y = 130 + Math.max(0, total - root.height) / 2
+      nodes.push(root)
+      let y = 130
+      for (const slot of slots) {
+        slot.groupCard.x = positions.group
+        slot.groupCard.y = y + (slot.height - slot.groupCard.height) / 2
+        nodes.push(slot.groupCard)
+        if (layout === 'mind') edges.push({ source: root.id, target: slot.groupCard.id, kind: 'organization' })
+        let memberY = y + Math.max(0, slot.height - slot.members.reduce((sum, member) => sum + member.height, 0)) / 2
+        for (const member of slot.members) {
+          member.node.x = layout === 'structure' && sourceColumn && !member.leaves.length ? 390 : positions.record
+          member.node.y = memberY + (member.height - 30 - member.node.height) / 2
+          nodes.push(member.node)
+          edges.push(layout === 'structure' ? { source: member.node.id, target: slot.groupCard.id, kind: 'organization' }
+            : { source: slot.groupCard.id, target: member.node.id, kind: 'organization' })
+          if (layout === 'structure') {
+            for (const target of member.leaves.length ? member.leaves : [member.node]) edges.push({ source: root.id, target: target.id, kind: 'organization' })
+          }
+          let leafY = memberY
+          for (const leaf of member.leaves) { leaf.x = positions.leaf; leaf.y = leafY; leafY += leaf.height + 20; nodes.push(leaf) }
+          memberY += member.height
+        }
+        y += slot.height + 44
+      }
+      return { title: title || text('摘录与结论', 'Excerpts and conclusions'), layout, en, ai, nodes, edges,
+        width: Math.max(...nodes.map(node => node.x + node.width)) + 48,
+        height: Math.max(...nodes.map(node => node.y + node.height)) + 100, recordCount: records.length }
+    }
+
+    function archiveDiagramSvg(document, paper = 'dark') {
+      const light = paper === 'light'
+      const palette = light ? { background: '#f7f9fc', frame: '#c5d2e1', text: '#172b42', muted: '#53667b', line: '#8b9cae',
+        root: ['#e8effa','#92abd0'], note: ['#edf7fc','#8db7c9'], decision: ['#f3eef9','#b09bc7'], source: ['#f0f5f8','#8ea7b3'],
+        assumption: ['#fff8e7','#c4a967'], group: ['#eaf3f3','#87b3b3'], synthesis: ['#f2edf8','#a48bbb'] }
+        : { background: '#10161f', frame: '#3e5169', text: '#e5ecf4', muted: '#9babbf', line: '#75869a',
+          root: ['#1b2635','#657e9b'], note: ['#192e3b','#497890'], decision: ['#2c263b','#79658f'], source: ['#1b2933','#4e6c7a'],
+          assumption: ['#302a1b','#9e874c'], group: ['#1c3035','#547e84'], synthesis: ['#2c263b','#84709f'] }
+      const esc = diagramXml
+      const nodeMap = new Map(document.nodes.map(node => [node.id, node]))
+      const lines = document.edges.map(edge => {
+        const a = nodeMap.get(edge.source), b = nodeMap.get(edge.target)
+        const right = b.x > a.x
+        const x1 = right ? a.x + a.width : a.x, x2 = right ? b.x : b.x + b.width
+        const y1 = a.y + a.height / 2, y2 = b.y + b.height / 2, mid = (x1 + x2) / 2
+        const color = edge.kind === 'source' ? (light ? '#528897' : '#71a6b2') : edge.kind === 'assumption' ? '#b39a58' : palette.line
+        let path = `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`
+        if (document.layout === 'structure' && edge.kind === 'organization') {
+          if (a.kind === 'root') path = `M${x1},${y1} C${x1+36},${y1} ${x1+36},${y2} ${x1+52},${y2} L${x2},${y2}`
+          else { const lane = x2 - 25; path = `M${x1},${y1} L${lane},${y1} C${lane},${y1} ${lane},${y2} ${x2},${y2}` }
+        }
+        return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.5"${edge.kind === 'organization' ? ' stroke-dasharray="4 4"' : ''} marker-end="url(#dmd-arrow)"/>`
+      }).join('')
+      const cards = document.nodes.map(node => {
+        const [fill, stroke] = palette[node.kind]
+        const bodyY = node.y + 48 + node.titleLines.length * 20
+        return `<g><rect x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="9" fill="${fill}" stroke="${stroke}"${node.kind === 'assumption' ? ' stroke-dasharray="4 3"' : ''}/>`
+          + `<text x="${node.x+16}" y="${node.y+25}" fill="${palette.muted}" font-size="11">${esc(node.label)}</text>`
+          + `<text fill="${palette.text}" font-size="${node.kind==='root'?18:14}" font-weight="600">${node.titleLines.map((line,index)=>`<tspan x="${node.x+16}" y="${node.y+49+index*20}">${esc(line)}</tspan>`).join('')}</text>`
+          + `<text fill="${palette.text}" font-size="12">${node.bodyLines.map((line,index)=>`<tspan x="${node.x+16}" y="${bodyY+index*18}">${esc(line)}</tspan>`).join('')}</text></g>`
+      }).join('')
+      const subtitle = document.en ? `${document.layout==='mind'?'Mind map':'Structure diagram'} · ${document.recordCount} selected records · ${document.ai?'AI synthesis, review required':'Local organization'}`
+        : `${document.layout==='mind'?'思维导图':'结构导图'} · ${document.recordCount} 条选中档案 · ${document.ai?'AI 归纳，待核对':'原文整理'}`
+      const footer = document.en ? 'Cards contain summaries or excerpts. Dashed lines organize content; solid arrows show saved sources or premises. Check the full originals in Archive.'
+        : '卡片为摘要或节选。虚线表示内容组织，实线箭头表示已存依据或前提；完整原文请在档案中核对。'
+      return `<svg xmlns="http://www.w3.org/2000/svg" width="${document.width}" height="${document.height}" viewBox="0 0 ${document.width} ${document.height}" role="img" aria-label="${esc(document.title)}" font-family="-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif"><title>${esc(document.title)}</title><desc>${esc(subtitle)}</desc><defs><marker id="dmd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="${palette.line}"/></marker></defs><rect width="100%" height="100%" fill="${palette.background}"/><rect x="18" y="18" width="${document.width-36}" height="${document.height-36}" rx="14" fill="none" stroke="${palette.frame}"/><text x="48" y="61" fill="${palette.text}" font-size="23" font-weight="600">${esc(graphLabel(document.title,60))}</text><text x="48" y="88" fill="${palette.muted}" font-size="12">${esc(subtitle)}</text>${lines}${cards}<text x="48" y="${document.height-42}" fill="${palette.muted}" font-size="11">${esc(footer)}</text></svg>`
+    }
+
+    function downloadDiagramBlob(blob, filename) {
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url; anchor.download = filename
+      document.body.append(anchor); anchor.click(); anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 10000)
+    }
+
+    async function diagramPng(svg, width, height) {
+      const scale = Math.min(2, Math.sqrt(16000000 / (width * height)), 16300 / width, 16300 / height)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.floor(width * scale)); canvas.height = Math.max(1, Math.floor(height * scale))
+      const context = canvas.getContext('2d')
+      if (!context) throw new Error('Canvas unavailable')
+      const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }))
+      try {
+        const image = new Image()
+        await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = () => reject(new Error('SVG could not be rendered')); image.src = url })
+        context.drawImage(image, 0, 0, canvas.width, canvas.height)
+        return await new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('PNG encoding failed')), 'image/png'))
+      } finally { URL.revokeObjectURL(url); canvas.width = 1; canvas.height = 1 }
+    }
+
+    const DIAGRAM_STYLES = `
+      .dmd-backdrop { position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center; padding: 20px; background: rgba(6,12,22,.55); backdrop-filter: blur(5px); }
+      .dmd-dialog { width: min(1340px, 100%); height: min(880px, calc(100vh - 40px)); display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--dsw-alias-border-l2); border-radius: 18px; box-shadow: 0 24px 90px rgba(0,0,0,.32); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: 13px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif; overflow: hidden; }
+      .dmd-head { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--dsw-alias-border-l1); flex: 0 0 auto; }
+      .dmd-head h3 { margin: 0; font-size: 19px; }
+      .dmd-head p { margin: 2px 0 0; color: var(--dsw-alias-label-secondary); font-size: 11px; }
+      .dmd-head > div:first-child { flex: 1; min-width: 0; }
+      .dmd-close { font-size: 22px !important; line-height: 1; padding: 5px 10px !important; }
+      .dmd-body { display: grid; grid-template-columns: 258px minmax(0, 1fr); min-height: 0; flex: 1; }
+      .dmd-picker { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--dsw-alias-border-l1); }
+      .dmd-picker-head { padding: 14px; display: flex; flex-direction: column; gap: 9px; }
+      .dmd-picker-head b { font-size: 13px; }
+      .dmd-input { box-sizing: border-box; min-width: 0; width: 100%; background: var(--dsw-alias-bg-base); color: inherit; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 7px 9px; font: inherit; outline: none; }
+      .dmd-input:focus { border-color: var(--dsp-accent, #659ce8); }
+      .dmd-picker-actions { display: flex; gap: 6px; align-items: center; }
+      .dmd-picker-actions select { width: 90px; padding: 5px; font-size: 11px; }
+      .dmd-records { flex: 1; overflow: auto; padding: 0 10px 12px; min-height: 0; }
+      .dmd-choice { display: flex; align-items: flex-start; gap: 8px; padding: 10px 9px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; margin-bottom: 5px; }
+      .dmd-choice.on { background: var(--dsp-accent-soft, #659ce815); border-color: var(--dsp-accent-soft, #659ce82a); }
+      .dmd-choice:hover { border-color: var(--dsp-accent, #659ce8); }
+      .dmd-choice input { margin: 4px 0 0; accent-color: var(--dsp-accent, #659ce8); flex-shrink: 0; }
+      .dmd-choice small { display: block; color: var(--dsw-alias-label-secondary); font-size: 10px; margin-bottom: 4px; }
+      .dmd-choice span { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; font-size: 12px; overflow-wrap: anywhere; }
+      .dmd-workspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+      .dmd-options { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+      .dmd-title-input { flex: 1; min-width: 150px; }
+      .dmd-switch { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; }
+      .dmd-switch button { border: 0; }
+      .dmd-settings { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 14px; color: var(--dsw-alias-label-secondary); font-size: 11px; }
+      .dmd-settings label { display: inline-flex; gap: 5px; align-items: center; }
+      .dmd-settings select { width: auto; padding: 3px 7px; font-size: 11px; }
+      .dmd-stage { position: relative; flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px; background: #0c1118; }
+      .dmd-stage.light { background: #e9eef5; }
+      .dmd-artboard { margin: 0 auto; box-shadow: 0 8px 30px rgba(0,0,0,.2); }
+      .dmd-artboard svg { display: block; width: 100%; height: 100%; }
+      .dmd-empty { display: grid; place-content: center; min-height: 240px; color: #9babbf; text-align: center; }
+      .dmd-bottom { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 9px 14px; border-top: 1px solid var(--dsw-alias-border-l1); flex-shrink: 0; }
+      .dmd-bottom small { flex: 1; color: var(--dsw-alias-label-secondary); font-size: 10px; min-width: 160px; }
+      .dmd-status { padding: 7px 14px; font-size: 11px; background: var(--dsp-accent-soft, #659ce815); flex-shrink: 0; }
+      .dmd-status.error { color: var(--dsw-alias-state-error-primary); }
+      .dmd-btn { white-space: nowrap; font-size: 12px; }
+      .dmd-btn:disabled { opacity: .4; cursor: default; }
+      @media (max-width: 760px) { .dmd-backdrop { padding: 8px; } .dmd-dialog { height: calc(100vh - 16px); } .dmd-body { grid-template-columns: minmax(150px, 30%) minmax(0, 1fr); } .dmd-head { padding: 12px; flex-wrap: wrap; } .dmd-options { padding: 8px; } .dmd-picker-head { padding: 10px; } }
+      @media (max-width: 480px) { .dmd-body { display: flex; flex-direction: column; } .dmd-picker { flex: 0 0 180px; border-right: 0; border-bottom: 1px solid var(--dsw-alias-border-l1); } .dmd-picker-head { padding: 6px 10px; gap: 4px; } .dmd-records { display: flex; gap: 5px; overflow-x: auto; } .dmd-choice { min-width: 180px; max-width: 180px; } .dmd-workspace { flex: 1; } }
+    `
+
+    function ArchiveDiagramDialog({ records, initialKind, en, onClose, theme, fontSize }) {
+      const t = (zh, english) => en ? english : zh
+      const initial = records.filter(record => record.kind === initialKind)
+      const [selected, setSelected] = React.useState(() => new Set((initial.length ? initial : records).slice(0, 8).map(record => record.id)))
+      const [filter, setFilter] = React.useState('')
+      const [kind, setKind] = React.useState('all')
+      const [layout, setLayout] = React.useState('structure')
+      const [title, setTitle] = React.useState('')
+      const [paper, setPaper] = React.useState('dark')
+      const [includeSources, setIncludeSources] = React.useState(true)
+      const [summary, setSummary] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
+      const [exporting, setExporting] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const [notice, setNotice] = React.useState('')
+      const [zoom, setZoom] = React.useState(.5)
+      const stageRef = React.useRef(null)
+      const dialogRef = React.useRef(null)
+      const requestRef = React.useRef(null)
+      const aliveRef = React.useRef(true)
+      const chosen = records.filter(record => selected.has(record.id))
+      const signature = JSON.stringify(chosen.map(record => [record.id, record.text]))
+      const chars = chosen.reduce((sum, record) => sum + record.text.length, 0)
+      const activeSummary = summary?.signature === signature ? summary : null
+      const actualTitle = title.trim() || activeSummary?.title || t('摘录与结论', 'Excerpts and conclusions')
+      const diagram = React.useMemo(() => chosen.length ? buildArchiveDiagram(chosen, {
+        layout, title: actualTitle, en, groups: activeSummary?.groups, ai: Boolean(activeSummary), includeSources,
+      }) : null, [signature, layout, actualTitle, en, activeSummary, includeSources])
+      const svg = React.useMemo(() => diagram ? archiveDiagramSvg(diagram, paper) : '', [diagram, paper])
+      const visible = records.filter(record => (kind === 'all' || record.kind === kind) && record.text.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()))
+      React.useEffect(() => {
+        requestRef.current?.abort(); requestRef.current = null
+        setBusy(false); setSummary(null); setError(''); setNotice('')
+      }, [signature])
+      React.useEffect(() => {
+        const allowed = new Set(records.map(record => record.id))
+        setSelected(old => [...old].every(id => allowed.has(id)) ? old : new Set([...old].filter(id => allowed.has(id))))
+      }, [records])
+      React.useEffect(() => {
+        aliveRef.current = true
+        const previous = document.activeElement
+        const overflow = document.body.style.overflow
+        document.body.style.overflow = 'hidden'
+        dialogRef.current?.querySelector('input')?.focus({ preventScroll: true })
+        const keydown = event => {
+          if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); return }
+          if (event.key !== 'Tab') return
+          const elements = [...(dialogRef.current?.querySelectorAll('button:not(:disabled), input, select') || [])].filter(element => element.getClientRects().length)
+          const first = elements[0], last = elements[elements.length - 1]
+          if (!first) return
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+        }
+        document.addEventListener('keydown', keydown, true)
+        return () => {
+          aliveRef.current = false; requestRef.current?.abort()
+          document.removeEventListener('keydown', keydown, true)
+          document.body.style.overflow = overflow
+          if (previous?.isConnected) previous.focus({ preventScroll: true })
+        }
+      }, [])
+      const toggle = id => {
+        setError('')
+        setSelected(old => {
+          const next = new Set(old)
+          if (next.has(id)) next.delete(id)
+          else if (next.size < DIAGRAM_MAX_RECORDS) next.add(id)
+          else { setError(t('一次最多选择 20 条，请先减少一些内容。', 'Select up to 20 records at a time.')); return old }
+          return next
+        })
+      }
+      const fit = all => {
+        if (!diagram || !stageRef.current) return
+        const width = (stageRef.current.clientWidth - 40) / diagram.width
+        const height = (stageRef.current.clientHeight - 40) / diagram.height
+        setZoom(Math.max(.08, Math.min(1, all ? Math.min(width, height) : width)))
+      }
+      React.useEffect(() => { fit(false) }, [layout, diagram?.width])
+      const summarize = async () => {
+        if (!chosen.length || busy) return
+        if (chars > DIAGRAM_MAX_CHARS) { setError(t('所选正文超过 24,000 字，请减少条目后再使用 AI 总结。', 'Reduce the selection to 24,000 characters before AI synthesis.')); return }
+        const controller = new AbortController()
+        requestRef.current?.abort(); requestRef.current = controller
+        setBusy(true); setError(''); setNotice('')
+        try {
+          const response = await fetch(DIAGRAM_ROUTE, { method: 'POST', credentials: 'same-origin', signal: controller.signal,
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ records: chosen.map(record => ({ id: record.id, kind: record.kind, text: record.text })), title: actualTitle, language: en ? 'en' : 'zh' }) })
+          const data = await response.json()
+          if (controller.signal.aborted || requestRef.current !== controller || !aliveRef.current) return
+          if (!response.ok || !data?.ok) throw new Error(en ? data?.messageEn || 'AI synthesis is unavailable. The original diagram can still be used.' : data?.message || 'AI 整理未完成，仍可使用原文导图。')
+          const groups = checkedDiagramGroups(data.groups, chosen)
+          setSummary({ signature, title: String(data.title || actualTitle).slice(0,100), groups })
+          setNotice(t('AI 归纳已生成，请核对摘要与来源后导出。', 'AI synthesis is ready. Review the summaries and sources before exporting.'))
+        } catch (cause) {
+          if (!controller.signal.aborted && requestRef.current === controller && aliveRef.current) setError(cause instanceof Error ? cause.message : t('AI 总结失败。', 'AI synthesis failed.'))
+        } finally { if (requestRef.current === controller && aliveRef.current) { requestRef.current = null; setBusy(false) } }
+      }
+      const cancel = () => { requestRef.current?.abort(); requestRef.current = null; setBusy(false); setNotice(t('已取消 AI 总结，保留当前导图。', 'AI synthesis cancelled. Your current diagram is preserved.')) }
+      const exportImage = async format => {
+        if (!diagram || busy || exporting) return
+        setExporting(true); setError('')
+        try {
+          const blob = format === 'svg' ? new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }) : await diagramPng(svg, diagram.width, diagram.height)
+          if (!aliveRef.current) return
+          const filename = actualTitle.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-').slice(0,60) || 'dsh-diagram'
+          downloadDiagramBlob(blob, `${filename}-${layout === 'mind' ? 'mind-map' : 'structure'}.${format}`)
+          setNotice(t(`${format.toUpperCase()} 已导出。`, `${format.toUpperCase()} exported.`))
+        } catch { if (aliveRef.current) setError(t('图片导出失败，请重试或先导出 SVG。', 'Image export failed. Retry or export SVG.')) }
+        finally { if (aliveRef.current) setExporting(false) }
+      }
+      const button = (label, onClick, disabled = false, extra = {}) => h('button', { type: 'button', className: 'dpl-btn dmd-btn', onClick, disabled, ...extra }, label)
+      return createPortal(h('div', { className: 'dmd-backdrop', style: { ...themeVars(theme), ...fontVars(fontSize) } },
+        h('style', null, LEDGER_STYLES + DIAGRAM_STYLES),
+        h('section', { className: 'dmd-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': t('导图工作台', 'Diagram workspace'), ref: dialogRef },
+          h('header', { className: 'dmd-head' },
+            h('div', null, h('h3', null, t('导图工作台', 'Diagram workspace')), h('p', null, t('选好材料，整理成图，预览后再导出。', 'Select records, organize a diagram, then preview and export.'))),
+            button(t('导出 SVG', 'Export SVG'), () => exportImage('svg'), !diagram || busy || exporting),
+            button(exporting ? t('正在导出…', 'Exporting…') : t('导出 PNG', 'Export PNG'), () => exportImage('png'), !diagram || busy || exporting),
+            button('×', onClose, false, { className: 'dpl-btn dmd-close danger', 'aria-label': t('关闭导图', 'Close diagram') })),
+          h('div', { className: 'dmd-body' },
+            h('aside', { className: 'dmd-picker' },
+              h('div', { className: 'dmd-picker-head' }, h('b', null, t(`选择材料 · ${chosen.length}/20`, `Select records · ${chosen.length}/20`)),
+                h('input', { className: 'dmd-input', value: filter, onChange: event => setFilter(event.target.value), placeholder: t('查找摘录或结论…', 'Find excerpts or conclusions…'), 'aria-label': t('筛选导图材料', 'Filter diagram records') }),
+                h('div', { className: 'dmd-picker-actions' },
+                  h('select', { className: 'dmd-input', value: kind, onChange: event => setKind(event.target.value), 'aria-label': t('材料类型', 'Record type') },
+                    h('option', { value: 'all' }, t('全部', 'All')), h('option', { value: 'note' }, t('摘录', 'Excerpts')), h('option', { value: 'decision' }, t('结论', 'Conclusions'))),
+                  button(visible.length > 20 ? t('选前20条', 'First 20') : t('全选', 'Select all'), () => setSelected(new Set(visible.slice(0,20).map(record => record.id)))),
+                  button(t('清空', 'Clear'), () => setSelected(new Set())))),
+              h('div', { className: 'dmd-records' }, ...visible.map(record => h('label', { className: 'dmd-choice' + (selected.has(record.id) ? ' on' : ''), key: record.id },
+                h('input', { type: 'checkbox', checked: selected.has(record.id), onChange: () => toggle(record.id), 'aria-label': `${record.kind === 'note' ? t('摘录', 'Excerpt') : t('结论', 'Conclusion')}：${record.text}` }),
+                h('div', null, h('small', null, `${record.kind === 'note' ? t('摘录', 'Excerpt') : t('结论', 'Conclusion')} · ${compactDate(record.item.createdAt, en)}`), h('span', null, record.text)))))),
+            h('main', { className: 'dmd-workspace' },
+              h('div', { className: 'dmd-options' },
+                h('input', { className: 'dmd-input dmd-title-input', value: title, maxLength: 100, onChange: event => setTitle(event.target.value), placeholder: actualTitle, 'aria-label': t('导图标题', 'Diagram title') }),
+                h('div', { className: 'dmd-switch', 'aria-label': t('导图类型', 'Diagram type') },
+                  ...[['mind', t('思维导图', 'Mind map')], ['structure', t('结构导图', 'Structure')]].map(([id,label]) => button(label, () => setLayout(id), false, { key: id, className: 'dpl-btn dmd-btn' + (layout===id?' active':''), 'aria-pressed': layout===id }))),
+                busy ? button(t('取消总结', 'Cancel synthesis'), cancel, false, { className: 'dpl-btn dmd-btn danger' }) : button(t('AI 总结', 'AI synthesis'), summarize, !chosen.length, { title: t('仅将所选正文交给当前模型整理，可能产生模型用量', 'Send only selected text to the current model; model usage may apply') })),
+              h('div', { className: 'dmd-settings' },
+                h('span', null, activeSummary ? t('AI 归纳 · 待核对', 'AI synthesis · review') : t('原文整理 · 不调用模型', 'Local organization · no model call')),
+                activeSummary ? button(t('恢复原文整理', 'Use original text'), () => setSummary(null)) : null,
+                h('label', { title: t('每条结论最多显示 2 条已存依据和 2 条假设；完整内容保留在档案中', 'Up to 2 saved sources and 2 premises per conclusion; full records remain in Archive') }, h('input', { type: 'checkbox', checked: includeSources, onChange: event => setIncludeSources(event.target.checked) }), t('附带已存依据与假设', 'Include saved sources and premises')),
+                h('select', { className: 'dmd-input', value: paper, onChange: event => setPaper(event.target.value), 'aria-label': t('导图配色', 'Diagram colors') }, h('option', { value: 'dark' }, t('深色', 'Dark')), h('option', { value: 'light' }, t('浅色', 'Light')))),
+              h('div', { className: 'dmd-stage' + (paper==='light'?' light':''), ref: stageRef, 'aria-label': t('导图在线预览', 'Live diagram preview') },
+                diagram ? h('div', { className: 'dmd-artboard', style: { width: `${diagram.width * zoom}px`, height: `${diagram.height * zoom}px` }, dangerouslySetInnerHTML: { __html: svg } })
+                  : h('div', { className: 'dmd-empty' }, t('从左侧选择摘录或结论，导图会在这里出现。', 'Select excerpts or conclusions to preview a diagram.'))),
+              h('div', { className: 'dmd-bottom' },
+                button('−', () => setZoom(value => Math.max(.08,value / 1.2)), !diagram, { 'aria-label': t('缩小导图', 'Zoom out diagram') }),
+                h('span', null, `${Math.round(zoom*100)}%`),
+                button('+', () => setZoom(value => Math.min(2,value * 1.2)), !diagram, { 'aria-label': t('放大导图', 'Zoom in diagram') }),
+                button(t('适应宽度', 'Fit width'), () => fit(false), !diagram), button(t('查看全图', 'Fit all'), () => fit(true), !diagram),
+                h('small', null, t(`已选 ${chosen.length} 条 · ${chars.toLocaleString()} 字。默认最近 8 条，可自行调整；卡片为摘要或节选。`, `${chosen.length} records · ${chars.toLocaleString()} characters. Starts with the latest 8; adjust the selection. Cards contain summaries or excerpts.`))))),
+          busy || error || notice ? h('div', { className: 'dmd-status' + (error?' error':''), role: 'status' }, busy ? t('正在根据所选内容整理导图…可随时取消。', 'Organizing selected records… You can cancel anytime.') : error || notice) : null)), document.body)
+    }
+
     function createLedger(ctx) {
       return function LedgerView(props) {
         const ledger = useLedger()
@@ -2465,6 +3402,9 @@ window.__ModuleLoader__.load({
         const [query, setQuery] = React.useState('')
         const [expanded, setExpanded] = React.useState(null)
         const [archiveNotice, setArchiveNotice] = React.useState('')
+        const [graphFocus, setGraphFocus] = React.useState(null)
+        const [diagramOpen, setDiagramOpen] = React.useState(false)
+        const archiveRootRef = React.useRef(null)
 
         React.useEffect(() => {
           const applyFocus = () => {
@@ -2518,6 +3458,27 @@ window.__ModuleLoader__.load({
             ...(entry.item.atoms || []).map(atom => atom.text)].join('\n').toLowerCase().includes(needle)))
         const openCount = assumptions.filter((item) => item.status === 'open').length
         const confirmedCount = assumptions.filter((item) => item.status === 'confirmed').length
+        const graph = React.useMemo(() => buildArchiveGraph({ decisions, assumptions, notes }), [ledger, scope, sessionId, query])
+        const diagramRecords = React.useMemo(() => [
+          ...decisions.filter(item => item.status !== 'revoked').map(item => ({ id: `decision:${item.id}`, kind: 'decision', text: String(item.claim || ''), item })),
+          ...notes.map(item => ({ id: `note:${item.id}`, kind: 'note', text: String(item.text || ''), item })),
+        ].filter(record => record.text.trim()).sort((a,b) => (Number(b.item.createdAt)||0) - (Number(a.item.createdAt)||0)), [ledger, scope, sessionId, query])
+        const revealGraphRecord = record => {
+          setSection(record.kind === 'decision' ? 'decisions' : record.kind === 'assumption' ? 'assumptions' : 'notes')
+          if (record.kind === 'decision') setExpanded(record.item.id)
+          setGraphFocus(record.id)
+        }
+        React.useEffect(() => {
+          if (!graphFocus) return undefined
+          const frame = window.requestAnimationFrame(() => {
+            const target = [...(archiveRootRef.current?.querySelectorAll('[data-archive-id]') || [])]
+              .find(element => element.getAttribute('data-archive-id') === graphFocus)
+            if (!target) return
+            target.scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+            target.focus({ preventScroll: true })
+          })
+          return () => window.cancelAnimationFrame(frame)
+        }, [graphFocus, section])
 
         const setStatus = (id, status) =>
           ledgerStore.update((current) => ({
@@ -2630,6 +3591,8 @@ window.__ModuleLoader__.load({
             onChange: (event) => setQuery(event.target.value),
           }),
           h(SettingsMenu, { key: 'settings' }),
+          ['notes', 'decisions'].includes(section) ? h('button', { className: 'dpl-btn', type: 'button', disabled: !diagramRecords.length,
+            onClick: () => setDiagramOpen(true), title: t('选择摘录和结论，预览并导出思维导图或结构导图', 'Select excerpts and conclusions to preview and export a diagram') }, t('生成导图', 'Create diagram')) : null,
           h('button', { className: 'dpl-btn', type: 'button', onClick: exportMarkdown },
             t('导出 MD', 'Export MD')),
           h('button', { className: 'dpl-btn', type: 'button', onClick: exportLedger },
@@ -2701,6 +3664,7 @@ window.__ModuleLoader__.load({
           return h('div', {
             key: decision.id,
             className: 'dpl-card' + (decision.status === 'revoked' ? ' revoked' : ''),
+            'data-archive-id': `decision:${decision.id}`, 'data-graph-focus': graphFocus === `decision:${decision.id}`, tabIndex: -1,
           },
             h(CollapsibleText, { text: decision.claim, en, variant: 'record', className: 'dpl-claim',
               metadata: h('div', { className: 'dpl-meta' },
@@ -2733,7 +3697,8 @@ window.__ModuleLoader__.load({
           )
         }
 
-        const renderAssumption = (item) => h('div', { key: item.id, className: 'dpl-asm-row' },
+        const renderAssumption = (item) => h('div', { key: item.id, className: 'dpl-asm-row',
+          'data-archive-id': `assumption:${item.id}`, 'data-graph-focus': graphFocus === `assumption:${item.id}`, tabIndex: -1 },
           h('div', { className: 'dpl-asm-text' },
             h(CollapsibleText, { text: item.text, en, variant: 'record' }),
             item.sourceClaim
@@ -2757,7 +3722,8 @@ window.__ModuleLoader__.load({
 
         const removeNote = id => setArchiveNotice(recycleNotice(recycleLedgerItem('notes', id), t))
 
-        const renderNote = (note) => h('div', { key: note.id, className: 'dpl-card' },
+        const renderNote = (note) => h('div', { key: note.id, className: 'dpl-card',
+          'data-archive-id': `note:${note.id}`, 'data-graph-focus': graphFocus === `note:${note.id}`, tabIndex: -1 },
           h(CollapsibleText, { text: note.text, en, variant: 'record', className: 'dpl-note',
             metadata: h('div', { className: 'dpl-meta' },
               h(CompactMeta, { time: note.createdAt, role: note.role, seq: note.seq, sessionId: note.sessionId, en }),
@@ -2804,13 +3770,16 @@ window.__ModuleLoader__.load({
                       'No notes yet. Select a passage and choose “Save as note”.'))
                 : h('div', { className: 'dpl-section' }, ...notes.map(renderNote)))
 
-        return h('div', { className: 'dpl-root', style: { ...themeVars(theme), ...fontVars(fontSize) } },
-          h('style', null, LEDGER_STYLES),
+        return h('div', { className: 'dpl-root', ref: archiveRootRef, style: { ...themeVars(theme), ...fontVars(fontSize) } },
+          h('style', null, LEDGER_STYLES + GRAPH_STYLES),
           header,
           stats,
           tabs,
           archiveNotice ? h('div', { className: 'dpl-notice', role: 'status' }, archiveNotice) : null,
-          content,
+          h('div', { className: 'dpl-record-area' }, content),
+          section !== 'trash' ? h(ArchiveGraphDock, { graph, en, onReveal: revealGraphRecord, archiveRootRef }) : null,
+          diagramOpen ? h(ArchiveDiagramDialog, { records: diagramRecords, initialKind: section === 'notes' ? 'note' : 'decision', en, theme, fontSize,
+            onClose: () => setDiagramOpen(false) }) : null,
         )
       }
     }
@@ -3702,11 +4671,14 @@ window.__ModuleLoader__.load({
             const detail = event.detail || {}
             const quote = String(detail.quote || '').trim()
             if (!quote) return
-            runJump(quote, Number(detail.seq) || null, detail.sessionId || null)
+            const seq = detail.seq == null ? null : Number(detail.seq)
+            if (detail.addressed && Number.isSafeInteger(seq) && seq >= 0) {
+              void runEvidenceJump(quote, seq, detail.sessionId || null)
+            } else runJump(quote, seq || null, detail.sessionId || null)
           }
           window.addEventListener(JUMP_EVENT, onJump)
           return () => window.removeEventListener(JUMP_EVENT, onJump)
-        }, [runJump])
+        }, [runJump, runEvidenceJump])
 
         // A note saved while the trace was still loading has no seq yet; fill
         // it in when the claim resolves so "Jump to source" becomes available.

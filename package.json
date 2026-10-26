@@ -1,7 +1,7 @@
 {
   "name": "dsh-chat-source-tracer",
-  "version": "0.3.1",
-  "description": "Trace AI answer sources in DeepSeek Harness chats, search across sessions, save excerpts and decisions, and ask follow-up questions with original quotes.",
+  "version": "0.4.0",
+  "description": "Trace AI answer sources in DeepSeek Harness chats, review original passages, connect archived excerpts and conclusions in a local graph, and preview or export mind maps and structure diagrams as PNG or SVG.",
   "type": "module",
   "license": "MIT",
   "author": "dsh-chat-source-tracer contributors",
@@ -19,6 +19,8 @@
     "cross-session-search",
     "research",
     "note-taking",
+    "knowledge-graph",
+    "mind-map",
     "溯源",
     "对话检索"
   ],
@@ -40,6 +42,7 @@
     "index.js",
     "retrieval.js",
     "related.js",
+    "diagram.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -50,6 +53,7 @@
     "PUBLISHING.md",
     "LICENSE",
     "docs/preview.jpg",
+    "docs/diagram-preview.png",
     "docs/TESTING.md",
     "screenshots.json"
   ],
@@ -77,7 +81,7 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check index.js && node --check client.js && node --check retrieval.js && node --check related.js",
+    "check": "node --check index.js && node --check client.js && node --check retrieval.js && node --check related.js && node --check diagram.js",
     "benchmark": "node scripts/benchmark.mjs",
     "preview": "node tests/serve.mjs"
   }

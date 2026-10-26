@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { retrieveAsync } from './retrieval.js'
 import { searchRelated, relationshipContext, validateRelationships, RELATION_SYSTEM, RELATION_KINDS } from './related.js'
+import { prepareDiagramInput, validateDiagramSummary, DIAGRAM_SYSTEM } from './diagram.js'
 
 /**
  * dsh-provenance — Host half.
@@ -23,6 +24,7 @@ const CORROBORATE_ROUTE = '/plugins/dsh-chat-source-tracer/corroborate'
 const SEARCH_ROUTE = '/plugins/dsh-chat-source-tracer/search'
 const RELATED_ROUTE = '/plugins/dsh-chat-source-tracer/related'
 const RELATION_ROUTE = '/plugins/dsh-chat-source-tracer/relationships'
+const DIAGRAM_ROUTE = '/plugins/dsh-chat-source-tracer/diagram'
 const BODY_LIMIT = 512 * 1024
 const MAX_ATOMS = 6
 const MAX_EVIDENCE_PER_ATOM = 3
@@ -62,10 +64,28 @@ export function apply(ctx) {
   route(SEARCH_ROUTE, searchSession)
   route(RELATED_ROUTE, relatedSessions)
   route(RELATION_ROUTE, analyzeRelationships)
+  route(DIAGRAM_ROUTE, summarizeDiagram)
 }
 
 const relatedHelpers = { collectEntries, resolveClaim, redactSecrets }
 const relationshipCache = new Map()
+const diagramCache = new Map()
+
+async function summarizeDiagram(ctx, input, signal) {
+  signal?.throwIfAborted()
+  const context = prepareDiagramInput(input, redactSecrets)
+  const { provider, model } = await resolveModel(ctx)
+  const key = createHash('sha256').update(JSON.stringify([provider, model, context])).digest('hex')
+  const cached = diagramCache.get(key)
+  if (cached && Date.now() - cached.at < 5 * 60_000) return { ...cached.result, meta: { ...cached.result.meta, cached: true } }
+  const completion = await completeJson(ctx, { provider, model, signal, system: DIAGRAM_SYSTEM,
+    prompt: JSON.stringify(context), kind: 'diagram', maxTokens: 2400, retryMaxTokens: 3200 })
+  const summary = validateDiagramSummary(completion.value, context)
+  const result = { ok: true, ...summary, meta: { cached: false, inputChars: context.chars, modelOutput: completion.meta } }
+  if (diagramCache.size >= 20) diagramCache.delete(diagramCache.keys().next().value)
+  diagramCache.set(key, { at: Date.now(), result })
+  return result
+}
 
 async function relatedSessions(ctx, input, signal) {
   try { return await searchRelated(ctx, input, signal, relatedHelpers) }
@@ -491,10 +511,12 @@ async function completeJson(ctx, options) {
         maxTokens: attempt ? retryMaxTokens : maxTokens,
       })
       const value = parseJson(completion.text)
-      const key = kind === 'relationships' ? 'relations' : kind === 'corroborate' ? 'picks' : 'atoms'
+      const key = kind === 'diagram' ? 'groups' : kind === 'relationships' ? 'relations' : kind === 'corroborate' ? 'picks' : 'atoms'
       const rows = value?.[key]
       const valid = value && !Array.isArray(value) && Array.isArray(rows) &&
-        (kind === 'relationships'
+        (kind === 'diagram'
+          ? rows.length > 0 && rows.length <= 6 && rows.every(row => row && typeof row.title === 'string' && row.title.trim() && typeof row.summary === 'string' && Array.isArray(row.recordIds))
+          : kind === 'relationships'
           ? rows.length > 0 && rows.length <= 6 && rows.every(row => row && typeof row.id === 'string' && RELATION_KINDS.includes(row.relation) && typeof row.quote === 'string' && typeof row.explanation === 'string')
           : kind === 'corroborate'
           ? rows.length <= 3 && rows.every(row => row && typeof row.quote === 'string' && Number.isSafeInteger(Number(row.page)))
@@ -975,7 +997,7 @@ function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
-export { collectEntries, resolveClaim, validateAtoms, buildPrompt, trace, locate, locateEvidence, searchSession, relatedSessions, analyzeRelationships, serve, complete, completeJson, errorReply, parseJson }
+export { collectEntries, resolveClaim, validateAtoms, buildPrompt, trace, locate, locateEvidence, searchSession, relatedSessions, analyzeRelationships, summarizeDiagram, serve, complete, completeJson, errorReply, parseJson }
 
 // Compatibility path: preserve the already-working excerpt navigation.
 function resolveNoteQuote(entries, quote) {
