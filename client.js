@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
     const SEARCH_ROUTE = '/plugins/dsh-chat-source-tracer/search'
     const RELATED_ROUTE = '/plugins/dsh-chat-source-tracer/related'
     const RELATION_ROUTE = '/plugins/dsh-chat-source-tracer/relationships'
+    const MATERIALS_ROUTE = '/plugins/dsh-chat-source-tracer/context-materials'
     const DIAGRAM_ROUTE = '/plugins/dsh-chat-source-tracer/diagram'
     const pendingCrossJump = { value: null }
     const ARM_EVENT = 'dsh-provenance:arm'
@@ -331,6 +332,30 @@ window.__ModuleLoader__.load({
       } catch {
         return false
       }
+    }
+
+    /** Use DSH's own plugin navigation and the registered built-in search card.
+     * No credentials are read or written, and no external settings URL is guessed.
+     */
+    async function openWebSearchSettings(ctx) {
+      try {
+        const navigation = ctx.get('pluginNavigation')
+        if (typeof navigation?.openList !== 'function') return false
+        navigation.openList()
+        return await new Promise(resolve => {
+          let observer, timer
+          const finish = value => { observer?.disconnect(); clearTimeout(timer); resolve(value) }
+          const find = () => {
+            const button = document.querySelector('[data-plugin-item="web-search"] button')
+            if (!button) return false
+            button.click(); finish(true); return true
+          }
+          if (find()) return
+          observer = new MutationObserver(find)
+          observer.observe(document.body, { childList: true, subtree: true })
+          timer = setTimeout(() => finish(false), 1500)
+        })
+      } catch { return false }
     }
 
     /** Select the resident shell tab, scoped to the requested conversation. */
@@ -696,6 +721,55 @@ window.__ModuleLoader__.load({
       )
     }
 
+    const INTERACTION_KEY = 'dsh-provenance:interaction:v1'
+    const POSITION_KEY = 'dsh-provenance:position:v1'
+    function readInteraction() {
+      try { const raw = JSON.parse(localStorage.getItem(INTERACTION_KEY) || '{}'); return { snap: raw.snap !== false, autoTrace: raw.autoTrace === true } }
+      catch { return { snap: true, autoTrace: false } }
+    }
+    const interactionStore = {
+      value: readInteraction(), listeners: new Set(),
+      set(patch) { this.value = { ...this.value, ...patch }; try { localStorage.setItem(INTERACTION_KEY, JSON.stringify(this.value)) } catch {} for (const fn of this.listeners) fn() },
+      subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) },
+    }
+    function useInteraction() { return React.useSyncExternalStore(fn => interactionStore.subscribe(fn), () => interactionStore.value) }
+    function clampPanelPosition(point, width, height, viewport, snap = false) {
+      const maxX = Math.max(8, viewport.width - width - 8), maxY = Math.max(8, viewport.height - height - 8)
+      let x = Math.min(maxX, Math.max(8, Number(point.x) || 8)), y = Math.min(maxY, Math.max(8, Number(point.y) || 8))
+      const edges = []
+      if (snap) {
+        if (x - 8 < 22) { x = 8; edges.push('left') } else if (maxX - x < 22) { x = maxX; edges.push('right') }
+        if (y - 8 < 22) { y = 8; edges.push('top') } else if (maxY - y < 22) { y = maxY; edges.push('bottom') }
+      }
+      return { x, y, edges }
+    }
+    function panelSizeLimits(viewport) {
+      const maxW = Math.max(1, viewport.width - 16), maxH = Math.max(1, viewport.height - 16)
+      return { minW: Math.min(320, maxW), minH: Math.min(240, maxH), maxW, maxH }
+    }
+    /** Keep the opposite edge fixed, clamp the moving edge, and never cross it. */
+    function resizePanelRect(rect, edge, delta, viewport) {
+      const limits = panelSizeLimits(viewport)
+      const w = Math.min(limits.maxW, Math.max(limits.minW, rect.w))
+      const h = Math.min(limits.maxH, Math.max(limits.minH, rect.h))
+      let left = Math.max(8, Math.min(viewport.width - w - 8, rect.x))
+      let top = Math.max(8, Math.min(viewport.height - h - 8, rect.y))
+      let right = left + w, bottom = top + h
+      const dx = Number.isFinite(delta.x) ? delta.x : 0, dy = Number.isFinite(delta.y) ? delta.y : 0
+      if (edge.includes('w')) left = Math.min(right - limits.minW, Math.max(8, left + dx))
+      if (edge.includes('e')) right = Math.max(left + limits.minW, Math.min(viewport.width - 8, right + dx))
+      if (edge.includes('n')) top = Math.min(bottom - limits.minH, Math.max(8, top + dy))
+      if (edge.includes('s')) bottom = Math.max(top + limits.minH, Math.min(viewport.height - 8, bottom + dy))
+      return { x: left, y: top, w: right - left, h: bottom - top }
+    }
+    function panelPositionForRect(rect, viewport) {
+      return { x: Math.max(0, Math.min(1, (rect.x - 8) / Math.max(1, viewport.width - rect.w - 16))),
+        y: Math.max(0, Math.min(1, (rect.y - 8) / Math.max(1, viewport.height - rect.h - 16))) }
+    }
+    function loadPanelPosition() {
+      try { const p = JSON.parse(localStorage.getItem(POSITION_KEY)); if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return { x: Math.max(0, Math.min(1,p.x)), y: Math.max(0,Math.min(1,p.y)) } } catch {}
+      return null
+    }
     const TAB_ORDER_KEY = 'dsh-provenance:panel-tab-order:v1'
     const DEFAULT_TAB_ORDER = ['trace', 'decisions', 'assumptions', 'notes']
 
@@ -903,6 +977,7 @@ window.__ModuleLoader__.load({
       const fontSize = useFontSize()
       const tabOrder = useTabOrder()
       const thinkingEffects = useThinkingEffects()
+      const interaction = useInteraction()
       const [open, setOpen] = React.useState(false)
       const wrapRef = React.useRef(null)
 
@@ -957,6 +1032,10 @@ window.__ModuleLoader__.load({
                   onChange: event => thinkingEffectsStore.set(event.target.checked) }),
                 h('span', null, '分析气泡与波浪 / Analysis effects'),
               ),
+              h('label', { className: 'dsp-settings-check' }, h('input', { type: 'checkbox', checked: interaction.snap, onChange: event => interactionStore.set({ snap: event.target.checked }) }), h('span', null, '窗口边缘吸附 / Snap to edges')),
+              h('label', { className: 'dsp-settings-check' }, h('input', { type: 'checkbox', checked: interaction.autoTrace, onChange: event => interactionStore.set({ autoTrace: event.target.checked }) }), h('span', null, '拖选后自动分析 / Auto trace selection')),
+              h('small', { className: 'dsp-note' }, '自动分析会调用模型；关闭时拖选只显示小按钮。 / Auto tracing calls the model; otherwise selection only shows a button.'),
+              h('button', { className: 'dsp-btn', type: 'button', onClick: () => { try { localStorage.removeItem(POSITION_KEY) } catch {} window.dispatchEvent(new Event('dsh-provenance:reset-position')) } }, '恢复窗口位置 / Reset position'),
               h('div', { className: 'dsp-settings-label' }, '标签顺序 / Tab order'),
               h('button', {
                 className: 'dsp-btn', type: 'button',
@@ -980,7 +1059,7 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(null)
       const [pinned, setPinned] = React.useState(null)
       const panelId = React.useId()
-      const filters = [['all', '全部', 'All'], ['user', '你的原话', 'Yours'], ['assistant', '结论', 'Conclusions'], ['tool', '外部', 'External']]
+      const filters = [['all', '全部', 'All'], ['user', '你的原话', 'Yours'], ['assistant', '结论', 'Conclusions'], ['tool', '外部', 'External'], ['later', '后续补充', 'Later supplements']]
       const activeFilter = filters.find(([value]) => value === filter) || filters[0]
       const tools = [
         { id: 'filter', label: `${t('筛选', 'Filter')} · ${t(activeFilter[1], activeFilter[2])}`, title: t('筛选依据来源', 'Filter evidence sources') },
@@ -1021,7 +1100,7 @@ window.__ModuleLoader__.load({
         expanded ? h('div', { className: 'dsp-analysis-content', id: panelId, role: 'region', 'aria-label': expanded.title },
           open === 'filter' ? h('div', { className: 'dsp-filters' }, ...filters.map(([value, zh, english]) =>
             h('button', { key: value, type: 'button', className: 'dsp-chip' + (filter === value ? ' active' : ''),
-              'aria-pressed': filter === value, onClick: () => onFilter(value) }, t(zh, english))))
+              'data-filter': value, 'aria-pressed': filter === value, onClick: () => onFilter(value) }, t(zh, english))))
           : open === 'chain' ? h('div', { className: 'dsp-timeline' }, ...timeline.map(node =>
             h('button', { key: node.seq, type: 'button', className: 'dsp-node' + (node.role === 'claim' ? ' claim' : ''),
               title: node.quote, onClick: () => onJump(node) },
@@ -1205,12 +1284,27 @@ window.__ModuleLoader__.load({
       @keyframes dsp-panel-exit {
         to { opacity: 0; transform: translate(18px, 26px) scale(.68); }
       }
+      .dsp-material-options { display: flex; align-items: center; flex: 1 0 auto; margin-right: auto; font-size: .92em; }
+      .dsp-material-options label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+      .dsp-material-options input { accent-color: var(--dsp-accent, var(--dsw-alias-brand-primary)); }
+      .dsp-materials { margin: 6px 0 12px; }
+      .dsp-material-group { margin: 12px 0; }
+      .dsp-later { border-left: 3px solid #36a898; padding-left: 10px; }
+      .dsp-rel-later { color: color-mix(in srgb, #36a898 72%, var(--dsw-alias-label-primary)); border-color: #36a89866; background: #36a89815; }
+      .dsp-filters .dsp-chip[data-filter="later"].active { border-color: #36a898; background: #36a89820; }
+      .dsp-materials article { margin-top: 8px; }
+      .dsp-quick-trace { position: fixed; z-index: 95; display: flex; gap: 6px; padding: 5px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 5px 18px rgba(0,0,0,.15); }
+      .dsp-head { cursor: grab; touch-action: none; }
+      .dsp-head:focus-visible { outline: 2px solid var(--dsp-accent, #4f8cff); outline-offset: -3px; }
+      .dsp-card[data-dragging="true"] .dsp-head { cursor: grabbing; }
+      .dsp-card[data-snapping="true"] { outline: 2px solid var(--dsp-accent, #4f8cff); outline-offset: 2px; }
+      .dsp-card[data-dragging="true"], .dsp-card[data-positioned="true"]:not(.dsp-closing) { animation: none; }
       .dsp-card {
         --dsp-hover-text: color-mix(in srgb, var(--dsw-alias-label-primary) 84%, #fff);
         --dsp-hover-border: color-mix(in srgb, var(--dsp-accent, #4f8cff) 72%, var(--dsw-alias-label-primary));
         --dsp-hover-ring: color-mix(in srgb, var(--dsp-accent, #4f8cff) 12%, transparent);
-        position: fixed; right: 20px; bottom: 96px; z-index: 70;
-        width: min(420px, calc(100vw - 40px)); max-height: 85vh;
+        position: fixed; right: 20px; bottom: 96px; z-index: 70; box-sizing: border-box;
+        width: min(420px, calc(100vw - 40px)); max-height: calc(100vh - 16px);
         display: flex; flex-direction: column;
         background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary);
         border: 1px solid color-mix(in srgb, var(--dsp-accent, #4f8cff) 25%, var(--dsw-alias-border-l2)); border-radius: 18px;
@@ -1230,15 +1324,21 @@ window.__ModuleLoader__.load({
       @media (prefers-reduced-motion: reduce) {
         .dsp-card, .dsp-card *, .dsp-hint, .dsp-hint::before, .dsp-hint::after, .dsp-frame, .dsp-trigger, .dsp-trigger::before, .dsp-trigger::after { animation: none !important; transition: none !important; }
       }
-      .dsp-resize {
-        position: absolute; right: 0; bottom: 0; width: 16px; height: 16px;
-        cursor: nwse-resize; touch-action: none;
-        background: transparent;
-        border-right: 2px solid var(--dsw-alias-border-l2);
-        border-bottom: 2px solid var(--dsw-alias-border-l2);
-        border-bottom-right-radius: 13px;
-      }
-      .dsp-resize:hover { border-color: var(--dsp-accent, var(--dsw-alias-brand-primary)); }
+      .dsp-resize { position: absolute; z-index: 5; touch-action: none; background: transparent; box-sizing: border-box; }
+      .dsp-resize:is(:focus-visible, :hover)::after { content: ''; position: absolute; inset: 1px; border-radius: 5px; background: var(--dsp-accent-soft, #4f8cff18); }
+      .dsp-resize[data-edge="n"], .dsp-resize[data-edge="s"] { left: 14px; right: 14px; height: 6px; cursor: ns-resize; }
+      .dsp-resize[data-edge="n"] { top: 0; }
+      .dsp-resize[data-edge="s"] { bottom: 0; }
+      .dsp-resize[data-edge="w"], .dsp-resize[data-edge="e"] { top: 14px; bottom: 14px; width: 6px; cursor: ew-resize; }
+      .dsp-resize[data-edge="w"] { left: 0; }
+      .dsp-resize[data-edge="e"] { right: 0; }
+      .dsp-resize[data-edge="nw"], .dsp-resize[data-edge="ne"], .dsp-resize[data-edge="sw"], .dsp-resize[data-edge="se"] { width: 14px; height: 14px; }
+      .dsp-resize[data-edge="nw"] { left: 0; top: 0; cursor: nwse-resize; }
+      .dsp-resize[data-edge="ne"] { right: 0; top: 0; cursor: nesw-resize; }
+      .dsp-resize[data-edge="sw"] { left: 0; bottom: 0; cursor: nesw-resize; }
+      .dsp-resize[data-edge="se"] { right: 0; bottom: 0; cursor: nwse-resize; }
+      .dsp-resize[data-edge="se"]::before { content: ''; position: absolute; inset: 4px 2px 2px 4px; border-right: 2px solid var(--dsw-alias-border-l2); border-bottom: 2px solid var(--dsw-alias-border-l2); border-bottom-right-radius: 5px; }
+      .dsp-card[data-resizing="true"] { user-select: none; }
       .dsp-timeline { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 6px; overflow: visible; }
       .dsp-node {
         flex: 0 0 auto; max-width: 156px; border: 1px solid var(--dsw-alias-border-l1);
@@ -1318,7 +1418,7 @@ window.__ModuleLoader__.load({
       .dsp-claim-text { line-height: 1.65; white-space: pre-wrap; }
       .dsp-claim-text.clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
       .dsp-claim-preview .dsp-claim-toggle { margin-top: 5px; }
-      .dsp-claim-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin-top: -6px; }
+      .dsp-claim-actions { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: -6px; }
       .dsp-tabbar { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding: 10px 12px 9px; }
       .dsp-tabs { position: relative; display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
       .dsp-tabs.sorting .dsp-tab { cursor: grabbing; }
@@ -1396,6 +1496,13 @@ window.__ModuleLoader__.load({
       .dsp-btn.active { border-color: var(--dsp-accent, var(--dsw-alias-border-l2)); color: var(--dsp-accent, var(--dsw-alias-label-primary)); background: var(--dsp-accent-soft, transparent); }
       .dsp-btn.active:not(:disabled):is(:hover, :focus-visible), .dsp-chip.active:is(:hover, :focus-visible), .dsp-tab.active:is(:hover, :focus-visible) { color: var(--dsp-hover-border); }
       .dsp-btn:disabled { opacity: .55; cursor: default; }
+      .dsp-claim-action { user-select: none; white-space: nowrap; }
+      .dsp-progress { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; margin: 0; }
+      .dsp-progress-message { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+      .dsp-progress-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+      .dsp-progress-time, .dsp-progress .dsp-cancel-analysis { flex-shrink: 0; }
+      .dsp-progress .dsp-cancel-analysis { white-space: nowrap; }
+      .dsp-body.dsp-busy { gap: 8px; }
       .dsp-card :is(.dsp-btn, .dsp-tab-export, .dsp-tab, .dsp-chip, .dsp-node, .dsp-flag),
       .dsp-ev :is(.dsp-ev-head, .dsp-ev-quote, .dsp-ev-why) {
         transition: color 160ms ease, border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease, filter 160ms ease;
@@ -1493,7 +1600,7 @@ window.__ModuleLoader__.load({
       .moving .dsp-wave-back { animation: dsp-mode-drift 14s linear infinite; }
       .moving .dsp-wave-front { animation: dsp-mode-drift 19s linear infinite; }
       .dsp-pill {
-        position: fixed; right: 20px; bottom: 96px; z-index: 70;
+        position: fixed; right: 20px; bottom: 96px; z-index: 70; box-sizing: border-box;
         display: flex; align-items: center; gap: 2px;
         background: var(--dsw-alias-bg-layer-1);
         border: 1px solid #6ea8ff; border-radius: 999px;
@@ -2287,8 +2394,8 @@ window.__ModuleLoader__.load({
         const raw = JSON.parse(localStorage.getItem(SIZE_KEY) || 'null')
         if (raw && Number.isFinite(raw.w) && Number.isFinite(raw.h)) {
           return {
-            w: Math.min(760, Math.max(320, raw.w)),
-            h: Math.max(0, Math.min(900, raw.h)),
+            w: Math.min(panelSizeLimits({ width: window.innerWidth, height: window.innerHeight }).maxW, Math.max(320, raw.w)),
+            h: raw.h > 0 ? Math.min(panelSizeLimits({ width: window.innerWidth, height: window.innerHeight }).maxH, Math.max(240, raw.h)) : 0,
           }
         }
       } catch {
@@ -4083,17 +4190,69 @@ window.__ModuleLoader__.load({
         const [errorHint, setErrorHint] = React.useState('')
         const [original, setOriginal] = React.useState(null)
         const [extra, setExtra] = React.useState(null)
+        const [materialOptions, setMaterialOptions] = React.useState({ includeTask: false })
+        const [materials, setMaterials] = React.useState({ status: 'idle', hits: [], unread: [] })
+        const [materialSelectionVersion, setMaterialSelectionVersion] = React.useState(0)
+        const materialAbortRef = React.useRef(null)
         const [filter, setFilter] = React.useState('all')
         const [elapsed, setElapsed] = React.useState(0)
         const [chatRect, setChatRect] = React.useState(null)
         const [chatHost, setChatHost] = React.useState(null)
         const [copied, setCopied] = React.useState(false)
+        const [minimized, setMinimized] = React.useState(false)
         const [size, setSize] = React.useState(loadSize)
+        const interaction = useInteraction()
+        const [quickSelection, setQuickSelection] = React.useState(null)
+        const [panelPosition, setPanelPosition] = React.useState(loadPanelPosition)
+        const [panelMeasure, setPanelMeasure] = React.useState({ width: window.innerWidth, height: window.innerHeight, cardHeight: 600 })
+        const [panelDragging, setPanelDragging] = React.useState(false)
+        const [panelResizing, setPanelResizing] = React.useState(false)
+        const [snapPreview, setSnapPreview] = React.useState(false)
+        const panelRef = React.useRef(null)
+        const dragCleanupRef = React.useRef(null)
+        const resizeCleanupRef = React.useRef(null)
+        React.useLayoutEffect(() => {
+          const measure = () => setPanelMeasure({ width: window.innerWidth, height: window.innerHeight, cardHeight: panelRef.current?.offsetHeight || 600 })
+          const reset = () => setPanelPosition(null)
+          const observer = new ResizeObserver(measure)
+          if (panelRef.current) observer.observe(panelRef.current)
+          window.addEventListener('resize', measure); window.addEventListener('dsh-provenance:reset-position', reset)
+          measure()
+          return () => { observer.disconnect(); dragCleanupRef.current?.(); resizeCleanupRef.current?.(); window.removeEventListener('resize', measure); window.removeEventListener('dsh-provenance:reset-position', reset) }
+        }, [mode === 'idle', minimized])
+        const sizeLimits = panelSizeLimits(panelMeasure)
+        const renderedSize = { w: Math.min(sizeLimits.maxW, Math.max(sizeLimits.minW, size.w)),
+          h: size.h ? Math.min(sizeLimits.maxH, Math.max(sizeLimits.minH, size.h)) : 0 }
+        const renderedHeight = renderedSize.h || Math.min(sizeLimits.maxH, panelMeasure.cardHeight)
+        const positionPixels = panelPosition ? clampPanelPosition({ x: 8 + panelPosition.x * Math.max(0,panelMeasure.width-renderedSize.w-16), y: 8 + panelPosition.y * Math.max(0,panelMeasure.height-renderedHeight-16) }, renderedSize.w, renderedHeight, panelMeasure) : clampPanelPosition({ x: panelMeasure.width-renderedSize.w-20, y: panelMeasure.height-renderedHeight-96 }, renderedSize.w, renderedHeight, panelMeasure)
+
+        const startPanelDrag = event => {
+          if (event.button !== 0 || event.target.closest('button, input, select, a, [role="button"]')) return
+          event.preventDefault(); resizeCleanupRef.current?.(); dragCleanupRef.current?.()
+          const card = panelRef.current, rect = card?.getBoundingClientRect()
+          if (!rect) return
+          const initial = { x: event.clientX, y: event.clientY }
+          let last = { x: rect.left, y: rect.top, edges: [] }
+          const applyPoint = point => {
+            last = clampPanelPosition(point, rect.width, rect.height, { width: window.innerWidth, height: window.innerHeight }, interactionStore.value.snap)
+            const normalized = { x: (last.x-8)/Math.max(1,window.innerWidth-rect.width-16), y: (last.y-8)/Math.max(1,window.innerHeight-rect.height-16) }
+            setPanelPosition(normalized); setSnapPreview(last.edges.length > 0)
+            return normalized
+          }
+          let normalized
+          const move = e => { normalized = applyPoint({ x: rect.left + e.clientX-initial.x, y: rect.top + e.clientY-initial.y }) }
+          const finish = () => {
+            if (normalized) try { localStorage.setItem(POSITION_KEY, JSON.stringify(normalized)) } catch {}
+            cleanup(); setPanelDragging(false); setSnapPreview(false)
+          }
+          const cleanup = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', finish); window.removeEventListener('pointercancel', finish); dragCleanupRef.current = null; setPanelDragging(false); setSnapPreview(false) }
+          dragCleanupRef.current = cleanup; setPanelDragging(true)
+          window.addEventListener('pointermove', move); window.addEventListener('pointerup', finish); window.addEventListener('pointercancel', finish)
+        }
         const [flagged, setFlagged] = React.useState(loadFeedback)
         const [pinnedId, setPinnedId] = React.useState(null)
         const [assumptionsSaved, setAssumptionsSaved] = React.useState(false)
         const [noteSaved, setNoteSaved] = React.useState(false)
-        const [minimized, setMinimized] = React.useState(false)
         const [notice, setNotice] = React.useState('')
         const reading = useReading()
         const abortRef = React.useRef(null)
@@ -4112,6 +4271,8 @@ window.__ModuleLoader__.load({
 
         const stopTracing = React.useCallback(() => {
           pendingCrossJump.value = null
+          materialAbortRef.current?.abort()
+          setQuickSelection(null)
           corroborateAbortRef.current?.abort()
           readingStore.clear()
           relatedAbortRef.current?.abort()
@@ -4154,6 +4315,9 @@ window.__ModuleLoader__.load({
         const runTrace = React.useCallback(
           async (quote, raw, identity) => {
             setShowTrash(false)
+            setQuickSelection(null)
+            setMaterialSelectionVersion(value => value + 1)
+            materialAbortRef.current?.abort()
             corroborateAbortRef.current?.abort()
             readingStore.generation++
             readingStore.set({ source: null, returning: false, travel: null })
@@ -4228,6 +4392,8 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           selectionRef.current = {}
+          setQuickSelection(null)
+          materialAbortRef.current?.abort()
           corroborateAbortRef.current?.abort()
           abortRef.current?.abort()
           jumpAbortRef.current?.abort()
@@ -4251,6 +4417,8 @@ window.__ModuleLoader__.load({
         }, [sessionId])
 
         const cancelAnalysis = () => {
+          materialAbortRef.current?.abort(); materialAbortRef.current = null
+          setMaterials(current => ({ ...current, status: current.hits?.length ? 'done' : 'idle' }))
           abortRef.current?.abort()
           abortRef.current = null
           corroborateAbortRef.current?.abort()
@@ -4272,30 +4440,51 @@ window.__ModuleLoader__.load({
           setNotice(t('已取消分析，可以重新选择文字。', 'Analysis cancelled. You can select another passage.'))
         }
 
-        const runCorroborate = React.useCallback(async () => {
+        const runCorroborate = React.useCallback(async (intent = 'web') => {
           if (!claim) return
           corroborateAbortRef.current?.abort()
           const controller = new AbortController()
           corroborateAbortRef.current = controller
-          setExtra({ status: 'loading' })
+          setExtra({ status: 'loading', intent })
           try {
             const response = await fetch(CORROBORATE_ROUTE, {
               method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ quote: claim }), signal: controller.signal,
+              body: JSON.stringify({ quote: claim, intent, language: en ? 'en' : 'zh' }), signal: controller.signal,
             })
             const data = await response.json().catch(() => null)
-            if (controller.signal.aborted) return
+            if (controller.signal.aborted || corroborateAbortRef.current !== controller) return
             if (!data || data.ok !== true) {
-              throw new Error((en ? data?.messageEn || data?.message : data?.message) || data?.error || t('检索失败', 'Search failed'))
+              throw Object.assign(new Error((en ? data?.messageEn || data?.message : data?.message) || t('操作暂时失败，请重试。', 'Operation failed. Please retry.')), { hint: en ? data?.hintEn : data?.hint, code: data?.error })
             }
-            setExtra({ status: 'done', sources: data.sources || [] })
+            setExtra({ status: 'done', intent, sources: data.sources || [], explanation: data.explanation || '' })
           } catch (cause) {
-            if (!controller.signal.aborted) setExtra({ status: 'error', error: cause instanceof Error ? cause.message : String(cause) })
+            if (!controller.signal.aborted && corroborateAbortRef.current === controller) setExtra({ status: 'error', intent, error: cause.message || t('操作失败，请重试。', 'Operation failed. Retry.'), hint: cause.hint, code: cause.code })
           } finally {
             if (corroborateAbortRef.current === controller) corroborateAbortRef.current = null
           }
         }, [claim, en])
 
+        const runMaterials = React.useCallback(async (analyze = false) => {
+          materialAbortRef.current?.abort()
+          const controller = new AbortController(); materialAbortRef.current = controller
+          setMaterials(current => ({ ...current, status: analyze ? 'analyzing' : 'loading', error: '' }))
+          try {
+            const response = await fetch(MATERIALS_ROUTE, { method: 'POST', credentials: 'same-origin', signal: controller.signal,
+              headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, quote: claim, ...selectionRef.current, ...materialOptions, includeLater: true, analyze }) })
+            const data = await response.json()
+            if (controller.signal.aborted || materialAbortRef.current !== controller) return
+            if (!response.ok || !data.ok) throw new Error(en ? data.messageEn || 'Materials unavailable. Retry.' : data.message || '材料读取失败，请重试。')
+            setMaterials({ ...data, status: 'done' })
+          } catch (cause) {
+            if (!controller.signal.aborted && materialAbortRef.current === controller) setMaterials(current => ({ ...current, status: 'error', error: cause.message || t('材料读取失败，请重试。', 'Could not read materials. Retry.') }))
+          } finally { if (materialAbortRef.current === controller) materialAbortRef.current = null }
+        }, [claim, sessionId, materialOptions, en])
+        React.useEffect(() => {
+          setMaterials({ status: 'idle', hits: [], unread: [] })
+          if (!claim || mode === 'idle' || traceScope !== 'session' || panelTab !== 'trace' || minimized || closing) { materialAbortRef.current?.abort(); return }
+          void runMaterials()
+          return () => materialAbortRef.current?.abort()
+        }, [runMaterials, materialSelectionVersion, mode === 'idle', traceScope, panelTab, minimized, closing])
         /** Jump requests come from the Archive tab, not from the chat view. */
         const showOriginalFallback = React.useCallback(async (seq, quote, targetSessionId) => {
           const targetSession = targetSessionId || sessionId
@@ -4726,6 +4915,7 @@ window.__ModuleLoader__.load({
           const onKey = (event) => {
             if (event.isComposing) return
             if (event.key === 'Escape') {
+              setQuickSelection(null)
               if (event.target?.closest?.('.dsp-search-dock')) return
               if (event.target?.closest?.('.dsp-analysis-tools')?.querySelector('[aria-expanded="true"]')) return
               // Let the settings popover consume Escape without exiting the mode.
@@ -4747,13 +4937,13 @@ window.__ModuleLoader__.load({
         }, [])
 
         React.useEffect(() => {
-          if (mode === 'idle' || mode === 'loading') return undefined
+          if (mode === 'loading') return undefined
           const onUp = (event) => {
             // Clicking our own hint or panel must never start a trace, even if
             // some text was still selected underneath.
-            if (event.target?.closest?.('.dsp-hint, .dsp-card, .dsp-pill, .dsp-source-actions, .dsp-reading-return')) return
+            if (event.target?.closest?.('.dsp-hint, .dsp-card, .dsp-pill, .dsp-source-actions, .dsp-reading-return, .dsp-quick-trace')) return
             window.setTimeout(() => {
-              if (modeRef.current === 'idle' || modeRef.current === 'loading') return
+              if (modeRef.current === 'loading') return
               const picked = readSelection()
               if (!picked.ok) {
                 // 'empty'/'outside' fire on every plain click while armed (no
@@ -4769,11 +4959,24 @@ window.__ModuleLoader__.load({
                 }
                 return
               }
+              if (modeRef.current === 'idle') {
+                const range = window.getSelection()?.getRangeAt(0), flow = findFlow()
+                const end = range && messageIdentity(range.endContainer.nodeType === 3 ? range.endContainer.parentElement : range.endContainer)
+                if (!flow || !range || !flow.contains(range.commonAncestorContainer) || picked.seq == null || picked.seq !== end?.seq) return
+                if (!interactionStore.value.autoTrace) {
+                  const rect = range.getBoundingClientRect()
+                  setQuickSelection({ ...picked, x: Math.max(8,Math.min(window.innerWidth-170,rect.left)), y: Math.max(8,Math.min(window.innerHeight-50,rect.bottom+8)) }); return
+                }
+              }
+              setQuickSelection(null)
               void runTrace(picked.quote, picked.raw, picked)
             }, 10)
           }
           document.addEventListener('mouseup', onUp, true)
-          return () => document.removeEventListener('mouseup', onUp, true)
+          const hide = () => setQuickSelection(null)
+          const changed = () => { if (!window.getSelection()?.toString().trim()) hide() }
+          document.addEventListener('selectionchange', changed); window.addEventListener('scroll', hide, true)
+          return () => { document.removeEventListener('mouseup', onUp, true); document.removeEventListener('selectionchange', changed); window.removeEventListener('scroll', hide, true) }
         }, [mode, runTrace])
 
         React.useEffect(() => {
@@ -4851,6 +5054,7 @@ window.__ModuleLoader__.load({
           () => () => {
             relatedAbortRef.current?.abort()
             relationsAbortRef.current?.abort()
+            materialAbortRef.current?.abort()
             corroborateAbortRef.current?.abort()
             abortRef.current?.abort()
             jumpAbortRef.current?.abort()
@@ -4908,32 +5112,51 @@ window.__ModuleLoader__.load({
           }
         }
 
-        const startResize = (event) => {
+        const applyResizeRect = (rect, persist = false) => {
+          const viewport = { width: window.innerWidth, height: window.innerHeight }
+          const next = { w: rect.w, h: rect.h }, position = panelPositionForRect(rect, viewport)
+          sizeRef.current = next; setSize(next); setPanelPosition(position)
+          if (persist) { saveSize(next); try { localStorage.setItem(POSITION_KEY, JSON.stringify(position)) } catch {} }
+        }
+        const startResize = (event, edge) => {
           if (event.button !== undefined && event.button !== 0) return
-          event.preventDefault()
-          event.stopPropagation()
-          const startX = event.clientX
-          const startY = event.clientY
-          const startW = sizeRef.current.w
-          const startH = sizeRef.current.h || Math.min(window.innerHeight * 0.64, 720)
-          const move = (moveEvent) => {
-            const w = Math.min(760, Math.max(320, startW + (moveEvent.clientX - startX)))
-            const h = Math.min(window.innerHeight * 0.85, Math.max(220, startH + (moveEvent.clientY - startY)))
-            const next = { w, h }
-            sizeRef.current = next
-            setSize(next)
+          event.preventDefault(); event.stopPropagation()
+          dragCleanupRef.current?.(); resizeCleanupRef.current?.()
+          const box = panelRef.current?.getBoundingClientRect()
+          if (!box) return
+          const start = { x: box.x, y: box.y, w: box.width, h: box.height }
+          const pointer = { x: event.clientX, y: event.clientY }, pointerId = event.pointerId
+          let last = start
+          const move = moveEvent => {
+            if (pointerId !== undefined && moveEvent.pointerId !== undefined && moveEvent.pointerId !== pointerId) return
+            last = resizePanelRect(start, edge, { x: moveEvent.clientX-pointer.x, y: moveEvent.clientY-pointer.y }, { width: window.innerWidth, height: window.innerHeight })
+            applyResizeRect(last)
           }
-          const up = () => {
-            window.removeEventListener('pointermove', move)
-            window.removeEventListener('pointerup', up)
-            saveSize(sizeRef.current)
+          const cleanup = () => {
+            window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', finish); window.removeEventListener('pointercancel', finish)
+            resizeCleanupRef.current = null; setPanelResizing(false)
           }
-          window.addEventListener('pointermove', move)
-          window.addEventListener('pointerup', up)
+          const finish = upEvent => {
+            if (upEvent && pointerId !== undefined && upEvent.pointerId !== undefined && upEvent.pointerId !== pointerId) return
+            applyResizeRect(last, true); cleanup()
+          }
+          resizeCleanupRef.current = cleanup; setPanelResizing(true)
+          try { event.currentTarget.setPointerCapture?.(pointerId) } catch {}
+          window.addEventListener('pointermove', move); window.addEventListener('pointerup', finish); window.addEventListener('pointercancel', finish)
+        }
+        const resizeWithKeyboard = (event, edge) => {
+          const deltas = { ArrowLeft: [-16,0], ArrowRight: [16,0], ArrowUp: [0,-16], ArrowDown: [0,16] }
+          if (event.key === 'Home' || event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); resetSize(); return }
+          if (!deltas[event.key]) return
+          event.preventDefault(); event.stopPropagation()
+          const box = panelRef.current?.getBoundingClientRect(); if (!box) return
+          const [x,y] = deltas[event.key]
+          applyResizeRect(resizePanelRect({ x:box.x,y:box.y,w:box.width,h:box.height },edge,{x,y},{width:window.innerWidth,height:window.innerHeight}), true)
         }
 
         const resetSize = () => {
           const next = { w: 420, h: 0 }
+          resizeCleanupRef.current?.()
           sizeRef.current = next
           setSize(next)
           saveSize(next)
@@ -5122,8 +5345,9 @@ window.__ModuleLoader__.load({
             if (atom.note) lines.push(`- 备注：${atom.note}`)
             lines.push('')
           }
-          if (extra && extra.sources && extra.sources.length > 0) {
-            lines.push('## 补充来源（AI 当时未使用）', '')
+          if (extra?.status === 'done' && (extra.explanation || extra.sources?.length)) {
+            lines.push(extra.intent === 'explain' ? '## 词句解释（AI 生成，未作事实核验）' : '## 本次补充资料（不计入历史依据）', '')
+            if (extra.explanation) lines.push(extra.explanation, '')
             for (const source of extra.sources) {
               lines.push(`- ${source.site || ''} 「${source.quote}」`)
               if (source.url) lines.push(`  - ${source.url}`)
@@ -5320,11 +5544,22 @@ window.__ModuleLoader__.load({
               ? t(`${sessionAssumptions.length} 条`, `${sessionAssumptions.length} assumptions`)
               : t(`${sessionNotes.length} 条`, `${sessionNotes.length} notes`)
 
+        if (idleEmpty && quickSelection) parts.push(h('div', { key: 'quick-selection', className: 'dsp-quick-trace', role: 'toolbar', 'aria-label': t('选词操作', 'Selection actions'), style: { ...themeVars(theme), left: quickSelection.x, top: quickSelection.y }, onPointerDown: event => event.preventDefault() },
+          h('button', { className: 'dsp-btn', type: 'button', onClick: () => { const chosen = quickSelection; setQuickSelection(null); void runTrace(chosen.quote, chosen.raw, chosen) } }, t('溯源这段', 'Trace selection')),
+          h('button', { className: 'dsp-x', type: 'button', 'aria-label': t('关闭选词操作', 'Dismiss selection actions'), onClick: () => setQuickSelection(null) }, '×')))
         if (idleEmpty) {
           return h(React.Fragment, null, ...parts)
         }
 
-        const header = h('div', { className: 'dsp-head', key: 'head' },
+        const header = h('div', { className: 'dsp-head', key: 'head', onPointerDown: startPanelDrag, tabIndex: 0, 'aria-label': t('移动溯源窗口', 'Move trace window'),
+          onKeyDown: event => {
+            if (!event.altKey || event.target !== event.currentTarget || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return
+            event.preventDefault();event.stopPropagation()
+            const rect=panelRef.current?.getBoundingClientRect();if(!rect)return
+            const next=clampPanelPosition({x:rect.left+(event.key==='ArrowLeft'?-16:event.key==='ArrowRight'?16:0),y:rect.top+(event.key==='ArrowUp'?-16:event.key==='ArrowDown'?16:0)},rect.width,rect.height,{width:window.innerWidth,height:window.innerHeight},interactionStore.value.snap)
+            const position={x:(next.x-8)/Math.max(1,window.innerWidth-rect.width-16),y:(next.y-8)/Math.max(1,window.innerHeight-rect.height-16)}
+            setPanelPosition(position);try{localStorage.setItem(POSITION_KEY,JSON.stringify(position))}catch{}
+          }, title: t('拖动标题栏移动；聚焦后 Alt + 方向键也可移动', 'Drag the header; Alt + arrow keys also move it') },
           h('span', { className: 'dsp-title' }, tabTitle),
           tabCount && (showTrash || panelTab !== 'trace') ? h('span', { className: 'dsp-count' }, tabCount) : null,
           h('span', { className: 'dsp-head-spacer', key: 'spacer' }),
@@ -5368,42 +5603,45 @@ window.__ModuleLoader__.load({
         )
 
         const body = []
-        const isAnalyzing = mode === 'loading' || extra?.status === 'loading' || relations.status === 'loading'
+        const isAnalyzing = mode === 'loading' || extra?.status === 'loading' || relations.status === 'loading' || materials.status === 'analyzing' || materials.status === 'loading'
         const cancelControl = h('button', { type: 'button', className: 'dsp-btn danger dsp-cancel-analysis', onClick: cancelAnalysis,
           title: t('中断正在进行的分析请求', 'Stop the active analysis request') }, t('取消分析', 'Cancel analysis'))
+        const progressRow = (text, key, showCancel = true, time = null) => h('div', { className: 'dsp-note dsp-progress', key },
+          h('div', { className: 'dsp-progress-message', role: 'status' }, h(LoadingSpinner),
+            h('span', { className: 'dsp-progress-label', title: text }, text),
+            time !== null ? h('span', { className: 'dsp-progress-time' }, ` ${time}s`) : null),
+          showCancel ? cancelControl : null)
 
         if (claim) {
           body.push(h(CollapsibleText, { text: claim, en, variant: 'claim', key: `claim-${claim}` }))
           body.push(
             h('div', { key: 'claim-actions', className: 'dsp-claim-actions' },
+              h('div', { className: 'dsp-material-options' },
+                h('label', { title: t('检索已保存在当前会话里的引用快照和工具读取正文，不会自动打开文件。', 'Search saved reference snapshots and recorded tool output; files are not opened automatically.') },
+                  h('input', { type: 'checkbox', checked: materialOptions.includeTask, onChange: event => setMaterialOptions(current => ({ ...current, includeTask: event.target.checked })) }), t('包含任务材料', 'Include task materials'))),
+              h('button', { className: 'dsp-btn dsp-claim-action', type: 'button', disabled: extra?.status === 'loading', onClick: () => void runCorroborate('explain'), title: t('将选中的词句交给当前模型解释，可能产生模型用量', 'Explain only the selected passage using the current model; usage may apply') }, t('解释词句', 'Explain passage')),
               h('button', {
-                className: 'dsp-btn',
+                className: 'dsp-btn dsp-claim-action',
                 type: 'button',
                 disabled: noteSaved,
                 onClick: saveNote,
                 title: t('把选中的话存进「档案 → 摘录」', 'Save this passage to Archive → Notes'),
               }, noteSaved ? t('已存笔记', 'Note saved') : t('存为笔记', 'Save as note')),
-              isAnalyzing ? cancelControl : null,
             ),
           )
         }
 
-        if (result) {
+        if (claim && (result || materials.status !== 'idle')) {
           body.push(h(TraceTools, { key: 'trace-tools', en, filter, onFilter: setFilter,
-            timeline: buildTimeline(result),
+            timeline: result ? buildTimeline(result) : [],
             onJump: node => void jumpTo({ seq: node.seq, quote: node.quote }, keywordsFor(result, node.seq)),
-            assumptions: result.assumptions || [], assumptionsSaved: assumptionsSaved || Boolean(pinnedId),
+            assumptions: result?.assumptions || [], assumptionsSaved: assumptionsSaved || Boolean(pinnedId),
             onSaveAssumptions: saveAssumptionsOnly,
           }))
         }
 
         if (mode === 'loading') {
-          body.push(
-            h('div', { className: 'dsp-note', key: 'loading', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-              h(LoadingSpinner),
-              t(`正在回看前面的对话… ${elapsed}s`, `Reading back through the conversation… ${elapsed}s`),
-            ),
-          )
+          body.push(progressRow(t('正在回看前面的对话…', 'Reading back through the conversation…'), 'loading', true, elapsed))
         }
 
         if (error) {
@@ -5426,7 +5664,7 @@ window.__ModuleLoader__.load({
               ),
             )
           }
-          for (const [index, atom] of orderAtoms(result.atoms).entries()) {
+          for (const [index, atom] of (filter === 'later' ? [] : orderAtoms(result.atoms)).entries()) {
             const evidence = atom.evidence || []
             const visible = filter === 'all' ? evidence : evidence.filter((item) => item.role === filter)
             body.push(
@@ -5437,7 +5675,7 @@ window.__ModuleLoader__.load({
                 ),
                 evidence.length === 0
                   ? h('div', { className: 'dsp-unsupported' },
-                      t('未找到依据——这句可能是模型自行补充的。', 'No supporting source found — the model may have added this itself.'),
+                      t('未找到依据：当前检索范围内没有可核对的较早原文。', 'No supporting source found in the earlier passages searched.'),
                     )
                   : visible.length === 0
                     ? h('div', { className: 'dsp-note' },
@@ -5507,21 +5745,53 @@ window.__ModuleLoader__.load({
             )
           }
 
+        }
+        if (claim) {
+          const visibleMaterials = (materials.hits || []).filter(hit => hit.category === 'later'
+            ? filter === 'all' || filter === 'later'
+            : materialOptions.includeTask && (filter === 'all' || hit.role === filter))
+          body.push(h('section', { key: 'materials', className: 'dsp-materials', 'aria-label': t('关联材料', 'Related material') },
+            materials.status === 'loading' || materials.status === 'analyzing' ? progressRow(materials.status === 'analyzing' ? t('正在分析材料关系…', 'Analyzing material relationships…') : t('正在查找后续补充与关联材料…', 'Finding later supplements and related material…'), 'materials-loading', mode !== 'loading' && extra?.status !== 'loading') : null,
+            materials.status === 'error' ? h('div', { role: 'status' }, materials.error, h('button', { className: 'dsp-btn', type: 'button', onClick: () => void runMaterials() }, t('重试读取材料', 'Retry materials'))) : null,
+            ...['task','later'].map(category => {
+              if (category === 'later' ? !['all','later'].includes(filter) : !materialOptions.includeTask || filter === 'later') return null
+              const hits = visibleMaterials.filter(hit => hit.category === category)
+              if (!hits.length && (category !== 'later' || filter !== 'later')) return null
+              return h('div', { key: category, className: 'dsp-material-group', 'data-material-category': category },
+                h('div', { className: 'dsp-extra-title' }, category === 'later' ? t('后续补充', 'Later supplements') : t('任务材料', 'Task materials')),
+                category === 'later' ? h('p', { className: 'dsp-note' }, t('晚于选句的相关消息；可继续核对，不代表原回答当时已使用。', 'Related messages after the selection; review them as later additions, not sources used at the time.')) : null,
+                !hits.length && materials.status === 'done' ? h('p', { className: 'dsp-note' }, t('当前读取范围内未找到后续补充。', 'No later supplements found in the readable scope.')) : null,
+                ...hits.map(hit => h('article', { key: hit.id, className: 'dsp-ev' + (category === 'later' ? ' dsp-later' : '') },
+                  h('div', { className: 'dsp-ev-head' },
+                    hit.category === 'later' ? h('span', { className: 'dsp-rel dsp-rel-later' }, t('后续补充', 'Later supplement')) : hit.kind === 'snapshot' ? `${t('引用快照：', 'Snapshot: ')}${hit.label}` : `${t('工具材料：', 'Tool material: ')}${hit.label}`,
+                    hit.category === 'later' ? h('span', null, t('晚于选句', 'After selection')) : null),
+                  hit.kind === 'snapshot' ? h('small', null, t(`捕获于 ${compactDate(hit.capturedAt,en)} · 来源截至 #${hit.capturedThroughSeq ?? '?'}${hit.truncated ? ' · 有截断' : ''}`, `Captured ${compactDate(hit.capturedAt,en)} · through #${hit.capturedThroughSeq ?? '?'}${hit.truncated ? ' · truncated' : ''}`)) : null,
+                  h(EvidenceQuote, { text: hit.quote, en }),
+                  hit.relation ? h('p', { className: 'dsp-note' }, t('AI 关联判断 · 待核对：', 'AI relationship · review: '), hit.relation.explanation) : h('p', { className: 'dsp-note' }, t('文本相关候选，尚未判断支持关系。', 'Text match; support has not been assessed.')),
+                  hit.kind === 'snapshot' ? h('button', { className: 'dsp-btn', type: 'button', onClick: () => { if (!openSessionById(ctx,hit.sourceSessionId)) setNotice(t('当前 DSH 暂时无法打开来源会话。', 'This DSH version cannot open the source conversation.')) } }, t('打开来源会话（当前版本）', 'Open source conversation (current)')) : h('button', { className: 'dsp-btn', type: 'button', onClick: () => void jumpTo(hit,[]) }, t('跳转原文', 'Open original')))))
+            }),
+            visibleMaterials.length ? h('button', { type: 'button', className: 'dsp-btn', disabled: ['loading','analyzing'].includes(materials.status), title: t('只将候选片段交给当前模型，可能产生模型用量', 'Send candidate excerpts to the current model; usage may apply'), onClick: () => void runMaterials(true) }, t('分析材料关系', 'Analyze relationships')) : null,
+            h('details', { className: 'dsp-note' }, h('summary', null, t('读取范围与未读取项', 'Read scope and unavailable material')),
+              h('p', null, t(`检索了 ${materials.meta?.taskRecords ?? 0} 条任务记录、${materials.meta?.laterRecords ?? 0} 条后续消息。本地查找不调用模型。`, `${materials.meta?.taskRecords ?? 0} task records and ${materials.meta?.laterRecords ?? 0} later messages scanned, without a model.`)),
+              materials.meta?.limited ? h('p', null, t('任务材料超过本次读取预算，结果不覆盖全部材料。', 'Task materials exceeded the read budget; coverage is incomplete.')) : null,
+              ...(materials.unread || []).map((item,i) => h('p', { key: i }, `${item.label}：${item.reason}`)),
+              h('p', null, t('只标记了 @文件路径而未读取的文件不会自动打开；不包含通用运行时注入内容。', 'Mentioned file paths are not opened automatically. Generic runtime injections are excluded.')))))
+        }
           if (extra) {
             const items = [
               h('div', { key: 'x-title', className: 'dsp-extra-title' },
-                t('同领域补充来源 · AI 当时未使用', 'Same-field sources · not used by the AI')),
+                extra.intent === 'explain' ? t('词句解释 · AI 生成，未作事实核验', 'Explanation · AI generated, unverified') : t('本次补充资料 · 不计入历史依据', 'New supplementary material · not historical evidence')),
             ]
             if (extra.status === 'loading') {
               items.push(
-                h('div', { key: 'x-loading', className: 'dsp-note', style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-                  h(LoadingSpinner),
-                  t('正在检索并抓取网页…', 'Searching and fetching pages…')),
+                progressRow(extra.intent === 'explain' ? t('正在解释选中的词句…', 'Explaining the selected passage…') : t('正在检索并抓取网页…', 'Searching and fetching pages…'), 'x-loading', mode !== 'loading'),
               )
             } else if (extra.status === 'error') {
               items.push(h('div', { key: 'x-err', className: 'dsp-note' },
-                t('检索失败：', 'Search failed: '), extra.error))
+                extra.error), extra.code === 'web_unconfigured' ? h('button', { className: 'dsp-btn', type: 'button', onClick: async () => { if (await openWebSearchSettings(ctx)) { setMinimized(true); setNotice(t('配置保存后展开溯源窗口，点击重试网页检索。', 'After saving, expand this window and retry web search.')) } else setNotice(t('请打开 DSH「插件 → 网页搜索」配置 API Key，再回来重试；旧版也可在「模型」页保存 DeepSeek 密钥。', 'Open DSH Plugins → Web search to configure the key, then retry. Older versions may use Models.')) } }, t('配置网页检索', 'Configure web search')) : null, extra.hint ? h('div', { className: 'dsp-note' }, extra.hint) : null, h('button', { className: 'dsp-btn', type: 'button', onClick: () => void runCorroborate(extra.intent) }, t('重试此操作', 'Retry this operation')))
             } else {
+              if (extra.explanation) items.push(h('div', { className: 'dsp-explanation', style: { whiteSpace: 'pre-wrap' } }, extra.explanation))
+              if (extra.intent !== 'explain' && !extra.sources?.length) items.push(h('div', { className: 'dsp-note' }, t('未找到可直接支撑所选说法的网页原句。可以重试，或先解释词句。', 'No supporting passage found. Retry or explain the passage.')))
               for (const [i, source] of (extra.sources || []).entries()) {
                 items.push(
                   h('div', { key: `x-${i}`, className: 'dsp-ev', style: { cursor: 'default' } },
@@ -5542,7 +5812,6 @@ window.__ModuleLoader__.load({
             }
             body.push(h('div', { key: 'extra', className: 'dsp-extra' }, ...items))
           }
-        }
 
         const STATUS_LABELS = [
           ['open', t('待确认', 'Open')],
@@ -5747,9 +6016,9 @@ window.__ModuleLoader__.load({
                   h('button', {
                     className: 'dsp-btn dsp-foot-cell',
                     type: 'button',
-                    disabled: !result || Boolean(extra),
-                    onClick: () => void runCorroborate(),
-                  }, extra ? t('已补充检索', 'Sources added') : t('补充检索网页', 'Search the web')),
+                    disabled: !claim || mode === 'loading' || extra?.status === 'loading',
+                    onClick: () => void runCorroborate('web'),
+                  }, extra?.status === 'loading' && extra.intent !== 'explain' ? t('检索中…', 'Searching…') : extra?.status === 'error' && extra.intent !== 'explain' ? t('重试网页检索', 'Retry web search') : extra?.status === 'done' && extra.intent !== 'explain' ? t('再次检索网页', 'Search again') : t('联网查资料', 'Search the web')),
                   h('button', {
                     className: 'dsp-btn dsp-foot-cell',
                     type: 'button',
@@ -5806,7 +6075,7 @@ window.__ModuleLoader__.load({
             body.push(h('div', { key: `related-${hit.id}`, className: 'dsp-note-item dsp-related-item' },
               h('div', { className: 'dsp-related-title' }, hit.title || t(`会话 #${hit.sessionId.slice(-6)}`, `Conversation #${hit.sessionId.slice(-6)}`)),
               h('div', { className: 'dsp-related-meta' }, h(CompactMeta, { time: hit.time, role: hit.role, seq: hit.seq, sessionId: hit.sessionId, en }),
-                h('span', null, hit.timing === 'after' ? t('晚于本条，不能作为当时的依据', 'Later than this passage; cannot be an earlier source')
+                h('span', null, hit.timing === 'after' ? t('后续补充 · 不计入此前依据', 'Later supplement · not an earlier source')
                   : hit.timing === 'before' ? t('早于本条', 'Earlier than this passage') : t('先后时间待确认', 'Relative time unknown'))),
               h('div', { className: 'dsp-note-text' }, hit.quote),
               relation ? h('div', { className: `dsp-related-explanation ${relation.relation}` },
@@ -5832,16 +6101,18 @@ window.__ModuleLoader__.load({
 
         parts.push(
           h('div', {
-            className: 'dsp-card' + ((closing || collapsing) ? ' dsp-closing' : ''),
+            className: 'dsp-card' + ((closing || collapsing) ? ' dsp-closing' : ''), ref: panelRef, 'data-positioned': Boolean(panelPosition), 'data-dragging': panelDragging, 'data-snapping': snapPreview, 'data-resizing': panelResizing,
             key: 'card',
             role: 'region',
             'aria-label': t('上下文溯源', 'Context provenance'),
             style: {
               ...themeVars(theme),
               ...fontVars(fontSize),
-              width: size.w,
-              maxWidth: 'calc(100vw - 40px)',
-              ...(size.h ? { height: size.h } : {}),
+              width: renderedSize.w,
+              minHeight: sizeLimits.minH,
+              ...(positionPixels ? { left: positionPixels.x, top: positionPixels.y, right: 'auto', bottom: 'auto' } : {}),
+              maxWidth: 'calc(100vw - 16px)',
+              ...(renderedSize.h ? { height: renderedSize.h } : {}),
             },
           },
             h(AnalysisAtmosphere, { key: 'thinking', active: thinkingEffects && isAnalyzing && panelTab === 'trace' && !showTrash && !panelQuery }),
@@ -5852,16 +6123,16 @@ window.__ModuleLoader__.load({
                   disabled: reading.returning, onClick: backToReading }, reading.returning ? t('正在返回…', 'Returning…') : t('↶ 返回刚才的位置', '↶ Back to reading')) : null,
                 notice ? h('span', { role: 'status' }, notice) : null) : null,
             showTrash ? null : tabs,
-            h('div', { className: 'dsp-body', ref: bodyRef, onWheel: bounceAtEdge }, ...body),
+            h('div', { className: 'dsp-body' + (mode === 'loading' ? ' dsp-busy' : ''), ref: bodyRef, onWheel: bounceAtEdge }, ...body),
             showTrash || inRelated ? null : footer,
             showTrash || panelTab === 'trace' ? null : searchDock,
-            h('div', {
-              key: 'resize',
-              className: 'dsp-resize',
-              onPointerDown: startResize,
-              onDoubleClick: resetSize,
-              title: t('拖动调整大小，双击复位', 'Drag to resize, double-click to reset'),
-            }),
+            ...[['nw','左上角','top left'],['n','上边','top'],['ne','右上角','top right'],['e','右边','right'],['se','右下角','bottom right'],['s','下边','bottom'],['sw','左下角','bottom left'],['w','左边','left']].map(([edge,zh,label]) => h('div', {
+              key: `resize-${edge}`, className: 'dsp-resize', 'data-edge': edge, role: 'button', tabIndex: 0,
+              'aria-label': t(`从${zh}调整窗口大小`, `Resize window from ${label}`),
+              onPointerDown: event => startResize(event, edge), onDoubleClick: resetSize,
+              onKeyDown: event => resizeWithKeyboard(event, edge),
+              title: t('拖动调整大小；方向键微调，双击或 Home 复位', 'Drag to resize; use arrow keys to adjust, double-click or Home to reset'),
+            })),
           ),
         )
 

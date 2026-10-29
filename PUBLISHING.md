@@ -1,6 +1,6 @@
 # 发布与市场收录
 
-GitHub Release 用于分发插件安装包，社区市场收录需另行提交。当前发布版本为 `0.4.0`，对应 tag 为 `v0.4.0`。社区目录中的安装包链接更新通过 PR 另行审核。
+GitHub Release 用于分发插件安装包，社区市场收录需另行提交。当前发布版本为 `0.5.0`，对应 tag 为 `v0.5.0`。社区目录中的安装包链接更新通过 PR 另行审核。
 
 ## 仓库与分发文件
 
@@ -26,7 +26,7 @@ npm pack --ignore-scripts
 
 ## 社区市场提交
 
-提交前核对最新的 [贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md) 和 [提交检查器](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/scripts/check-submission.mjs)。以下为 2026-10-21 核对的检查项：
+提交前核对最新的 [贡献指南](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/contributing.md) 和 [提交检查器](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/scripts/check-submission.mjs)。以下为 2026-10-29 核对的检查项：
 
 | 检查项 | 要求 |
 | --- | --- |

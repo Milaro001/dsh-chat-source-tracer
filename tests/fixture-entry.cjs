@@ -6,6 +6,9 @@ const handlers = new Map()
 let pluginContext
 let setOldVisible
 let setArchiveVisible
+let setLaterVisible=()=>{}
+let setFixtureSettings=()=>{}
+window.fixtureConfigNavigations=0
 let setFixtureSession
 let remountMessages
 let setLongSelection
@@ -23,6 +26,7 @@ const relatedSources=[
  {seq:4,role:'user',turn:1,messageId:'other-user',quote:'紫杉协议采用环形索引，确保长对话中的定位一致性。但我后来想补充一个恢复方案。'},
 ]
 const traceResult={ok:true,claim:{seq:900,role:'assistant',turn:600,step:1,resolved:true},atoms:sources.map((ev,i)=>({text:['采用环形索引以保证定位一致性','保留长对话中的原文定位能力','这项设计需要核对外部协议'][i],relation:i===1?'inference':'direct',keywords:['紫杉协议','环形索引','定位'],evidence:[{...ev,why:'与这句话讨论的是同一项约束。',strength:'strong'}]})),assumptions:['历史记录保存完整，且目标消息尚未被修改。'],meta:{model:'本地测试替身',elapsedMs:42,messageCount:20000,retrieval:{scannedMessages:20000,selectedPassages:23}}}
+const reviewMode = new URLSearchParams(location.search).has('review')
 const graphDemo = new URLSearchParams(location.search).has('graph-demo')
 if(graphDemo){
  const time=Date.UTC(2026,9,26,10,0)
@@ -54,11 +58,14 @@ window.fixtureSearchRequests=[]
 window.fixtureTraceCalls=0
 window.fixtureTraceRequests=[]
 window.fixtureWebRequests=[]
+window.fixtureMaterialRequests=[]
+let webBehavior='normal'
 window.fixtureRelationRequests=[]
 window.fixtureViewActivations=[]
 window.fetch=async (url,init)=>{
  if(!/^\/plugins\/dsh-chat-source-tracer\//.test(String(url)))return realFetch(url,init)
  const body=JSON.parse(init.body||'{}')
+ if(String(url).endsWith('/context-materials')){window.fixtureMaterialRequests.push(body);return realFetch(url,init)}
  if(String(url).endsWith('/diagram')){
   const request={aborted:false,completed:false,body};window.fixtureDiagramRequests.push(request)
   init.signal?.addEventListener('abort',()=>{request.aborted=true},{once:true})
@@ -109,13 +116,17 @@ window.fetch=async (url,init)=>{
   request.completed=true;return Response.json(response)
  }
  if(String(url).endsWith('/corroborate')){
-  const request={aborted:false,completed:false};window.fixtureWebRequests.push(request)
+  const request={aborted:false,completed:false,body};window.fixtureWebRequests.push(request)
+  if(webBehavior==='unconfigured')return Response.json({ok:false,error:'web_unconfigured',message:'尚未配置可用的网页检索服务。',hint:'请在 DSH 的模型与网页检索配置中检查检索提供方的凭据。'})
+  if(webBehavior==='empty')return Response.json({ok:true,sources:[]})
+  if(body.intent==='explain')return Response.json({ok:true,explanation:'紫杉协议是用于演示定位流程的虚构术语。解释不等于历史依据。',sources:[]})
   init.signal?.addEventListener('abort',()=>{request.aborted=true},{once:true})
   await new Promise(resolve=>setTimeout(resolve,900));request.completed=true
   return Response.json({ok:true,sources:[{quote:'迟到的网页材料',site:'example.org',url:'https://example.org/fixture'}]})
  }
  if(String(url).endsWith('/locate-evidence')){
   const source=(body.sessionId==='synthetic-other'?relatedSources:sources).find(s=>s.seq===body.seq)||(body.seq===900?{seq:900,role:'assistant',turn:600,step:1,messageId:'current-ai',quote:claim}:null)
+  if(!source&&body.seq===920)return Response.json({ok:true,seq:920,role:'user',messageId:'later-note',quote:body.quote,text:'后续补充：紫杉协议应采用环形索引，确保定位一致性，但恢复流程还要核对消息编号。'})
   if(!source)return Response.json({ok:false})
   return Response.json({ok:true,...source})
  }
@@ -141,8 +152,9 @@ const bindingContext={}
 const ctx={
  get(name){
   if(name==='conversation')return {input:{for(actx){if(actx!==bindingContext)throw Error('wrong context');return inputShell}}}
-  if(name==='sessions')return {binding(){return {ctx:bindingContext,session:{async loadThrough(seq){window.fixtureLoads.push(seq);setOldVisible(true)}}}}}
+  if(name==='sessions')return {binding(){return {ctx:bindingContext,session:{async loadThrough(seq){window.fixtureLoads.push(seq);setOldVisible(true);if(seq===920)setLaterVisible(true)}}}}}
   if(name==='uiConversation')return {binding(){return {activate(view){window.fixtureViewActivations.push(view)}}}}
+  if(name==='pluginNavigation')return {openList(){window.fixtureConfigNavigations++;setFixtureSettings('list')}}
   if(name==='uiWorkspace')return {openSession(id){setFixtureSession(typeof id==='string'?id:id.sessionId)}}
   if(name==='locale')return {current:'zh-CN'}
  },
@@ -165,6 +177,8 @@ function App(){
  const [longSelection,setLong]=React.useState(false)
  setLongSelection=setLong
  const [old,setOld]=React.useState(false)
+ const [fixtureSettings,updateSettings]=React.useState(null);setFixtureSettings=updateSettings
+ const [laterVisible,setLater]=React.useState(false);setLaterVisible=setLater
  const [messageEpoch,setMessageEpoch]=React.useState(0)
  remountMessages=()=>setMessageEpoch(value=>value+1)
  const [archiveVisible,setArchive]=React.useState(graphDemo)
@@ -175,7 +189,8 @@ function App(){
  const Panel=handlers.get('shell.overlay')
  const Archive=handlers.get('conversation.view')
  return h(React.Fragment,null,
-  h('div',{className:'fixture-toolbar'},h('b',null,'DSH 对话溯源助手 · 本地验证'),h('button',{id:'run-tests',onClick:()=>void runTests()},'运行浏览器回归测试'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗'),h('button',{id:'switch-session',onClick:()=>setActiveSession(id=>id==='synthetic'?'synthetic-other':'synthetic')},'切换测试会话'),h('button',{id:'stress-message',onClick:()=>setLargeMessage(value=>!value)},'长消息验证'),h('button',{id:'toggle-archive',onClick:()=>setArchive(value=>!value)},'查看测试档案'),h('button',{id:'demo-followup',onClick:()=>void demoFollowup()},'演示原文追问'),h('button',{id:'demo-long-selection',title:'Shift + 点击演示取消分析',onClick:event=>void(event.shiftKey?demoCancelAnalysis():demoLongSelection())},'演示长选文'),h('span',{id:'test-summary'},'等待运行')),
+  fixtureSettings==='list'?h('div',{'data-plugin-item':'web-search'},h('button',{onClick:()=>updateSettings('web')},'查看 网页搜索')):fixtureSettings==='web'?h('section',{'data-fixture-config':true},h('h2',null,'网页搜索配置（模拟）'),h('p',null,'在 DSH 的此处填写检索凭据，测试不读写密钥。')):null,
+  reviewMode ? h('div',{className:'fixture-toolbar',style:{maxWidth:620,height:'auto',flexWrap:'wrap',padding:'66px 24px 12px',boxSizing:'border-box',position:'relative'}},h('b',null,'V0.5 · 虚构会话 / 模拟模型'),h('button',{onClick:()=>void demoReview('selection')},'演示选词入口'),h('button',{onClick:()=>void demoReview('progress')},'演示分析进度'),h('button',{onClick:()=>void demoReview('web')},'演示检索失败与重试'),h('button',{onClick:()=>void demoReview('materials')},'查看任务材料与后续补充'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗')) : h('div',{className:'fixture-toolbar'},h('b',null,'DSH 对话溯源助手 · 本地验证'),h('button',{id:'run-resize-tests',onClick:()=>void runResizeTests()},'检查窗口缩放'),h('button',{id:'run-interaction-tests',onClick:()=>void runInteractionTests()},'检查检索与选词交互'),h('button',{id:'run-tests',onClick:()=>void runTests()},'运行浏览器回归测试'),h('button',{id:'toggle-theme',onClick:()=>{document.documentElement.dataset.fixtureTheme=document.documentElement.dataset.fixtureTheme==='dark'?'light':'dark'}},'切换明暗'),h('button',{id:'switch-session',onClick:()=>setActiveSession(id=>id==='synthetic'?'synthetic-other':'synthetic')},'切换测试会话'),h('button',{id:'stress-message',onClick:()=>setLargeMessage(value=>!value)},'长消息验证'),h('button',{id:'toggle-archive',onClick:()=>setArchive(value=>!value)},'查看测试档案'),h('button',{id:'demo-followup',onClick:()=>void demoFollowup()},'演示原文追问'),h('button',{id:'demo-long-selection',title:'Shift + 点击演示取消分析',onClick:event=>void(event.shiftKey?demoCancelAnalysis():demoLongSelection())},'演示长选文'),h('span',{id:'test-summary'},'等待运行')),
   h('div',{'data-slot':'conversation.session',style:{display:'contents'}}),
   ready&&graphDemo&&h('button',{id:'run-graph-dock-tests',onClick:()=>void runGraphDockTests(),style:{position:'fixed',top:16,right:20,zIndex:20}},'检查底部呼出'),
   ready&&graphDemo&&h('button',{id:'run-diagram-tests',onClick:()=>void runDiagramWorkspaceTests(),style:{position:'fixed',top:16,right:140,zIndex:20}},'检查导图工作台'),
@@ -186,8 +201,9 @@ function App(){
    h('section',{'data-slot':'conversation.session'},h('div',{'data-slot':'conversation.chat.flow',className:'chat-flow'},
     old && (activeSession==='synthetic-other'?relatedSources:sources).map(source=>h(SourceNode,{key:`${messageEpoch}-${source.seq}`,node:{kind:source.role==='assistant'?'assistant-step':'user',data:source.role==='assistant'?{turn:source.turn,step:1,finalNode:{...source,kind:'assistant'}}:{...source,kind:source.role}}},
      h('small',null,source.role==='assistant'?'AI 历史结论':source.role==='user'?'你的原话':'外部工具资料'),...source.quote.split('\n\n').map((part,i)=>h('p',{key:i},part.startsWith('**')?h('strong',null,part.replace(/\*\*/g,'')):(largeMessage&&source.seq===3&&i===0?'普通背景说明。'.repeat(1300)+part:part))))),
-    h('div',{className:'spacer'},'很早以前的讨论位于上方，由 DSH 分页加载。'),
+    h('div',{className:'spacer',style:reviewMode?{height:50}:undefined},'很早以前的讨论位于上方，由 DSH 分页加载。'),
     h(SourceNode,{key:messageEpoch,node:{kind:'assistant-step',data:{turn:600,step:1,finalNode:{seq:900,kind:'assistant',messageId:'current-ai'}}}},h('small',null,'AI 当前回答'),h('p',{id:'claim'},longSelection?longSelectionText:claim),h('p',null,'这段回答用于检查历史依据的加载、消息限定和关键词高亮。'),h('p',{id:'decoy'},'紫杉协议采用环形索引，确保长对话中的定位一致性。 该协议保留原文的段落结构。')),
+   laterVisible&&h(SourceNode,{node:{kind:'user',data:{seq:920,role:'user',messageId:'later-note'}}},h('p',null,'后续补充：紫杉协议应采用环形索引，确保定位一致性，但恢复流程还要核对消息编号。')),
    )),
    h('footer',null,h('textarea',{id:'fixture-composer','aria-label':'测试输入框',defaultValue:draftState.draft,onChange:event=>{draftState.draft=event.target.value;draftState.draftRev++},style:{flex:1,minWidth:0,height:70,resize:'vertical',border:'1px solid var(--dsw-alias-border-l2)',borderRadius:10,background:'var(--dsw-alias-bg-base)',color:'var(--dsw-alias-label-primary)',padding:10}}),ready&&h(Trigger,{sessionId:activeSession}))),
   ready&&archiveVisible&&h('div',{id:'fixture-archive',style:{position:'fixed',top:82,left:32,right:graphDemo?'auto':470,
@@ -305,7 +321,7 @@ async function runGraphDockTests(){
  enter();await until(()=>dock().classList.contains('open'),'最终展开失败');await wait(400)
  document.querySelector('#test-summary').textContent=`${checks.filter(x=>x.ok).length}/${checks.length} 底部呼出检查通过`
 }
-async function selectClaim(){const calls=window.fixtureTraceCalls;const element=document.querySelector('#claim');const range=document.createRange();range.selectNodeContents(element);const sel=getSelection();sel.removeAllRanges();sel.addRange(range);element.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));await until(()=>window.fixtureTraceCalls>calls&&document.querySelectorAll('.dsp-ev').length===3,'结果未出现')}
+async function selectClaim(){const calls=window.fixtureTraceCalls;const element=document.querySelector('#claim');const range=document.createRange();range.selectNodeContents(element);const sel=getSelection();sel.removeAllRanges();sel.addRange(range);element.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));await until(()=>window.fixtureTraceCalls>calls&&document.querySelectorAll('.dsp-atom .dsp-ev').length===3,'结果未出现')}
 async function demoCancelAnalysis(){
  relatedMode='empty'
  await demoLongSelection()
@@ -408,8 +424,8 @@ async function runTests(){
   if(Math.abs(claimElement.getBoundingClientRect().top-scroll.getBoundingClientRect().top-offset)>5)throw Error('分页加载改变了原阅读位置 '+JSON.stringify({offset,after:claimElement.getBoundingClientRect().top-scroll.getBoundingClientRect().top,top:scroll.scrollTop,anchor:document.querySelector('[data-chat-node-key="node-900"]').getBoundingClientRect().top-scroll.getBoundingClientRect().top}))
  })
  await test('未挂载的 AI 依据由公开 loadThrough 加载并选中',async()=>{getSelection().removeAllRanges();document.querySelector('.dsp-ev').click();await until(()=>normalize(getSelection().toString())===normalize(quote),'未选中 AI 原文');if(!window.fixtureLoads.includes(3))throw Error('未调用按消息编号加载');const row=getSelection().anchorNode.parentElement.closest('[data-chat-node-key]');if(row?.dataset.chatNodeKey!=='node-3')throw Error('跳错消息')})
- await test('用户原话可以单独定位',async()=>{getSelection().removeAllRanges();[...document.querySelectorAll('.dsp-ev')].find(el=>el.textContent.includes(sources[1].quote)).click();await until(()=>getSelection().toString()===sources[1].quote,'未选中用户原话')})
- await test('工具材料可以在对话内定位',async()=>{getSelection().removeAllRanges();[...document.querySelectorAll('.dsp-ev')].find(el=>el.textContent.includes(sources[2].quote)).click();await until(()=>getSelection().toString()===sources[2].quote,'未选中工具原文')})
+ await test('用户原话可以单独定位',async()=>{getSelection().removeAllRanges();[...document.querySelectorAll('.dsp-atom .dsp-ev')].find(el=>el.textContent.includes(sources[1].quote)).click();await until(()=>getSelection().toString()===sources[1].quote,'未选中用户原话')})
+ await test('工具材料可以在对话内定位',async()=>{getSelection().removeAllRanges();[...document.querySelectorAll('.dsp-atom .dsp-ev')].find(el=>el.textContent.includes(sources[2].quote)).click();await until(()=>getSelection().toString()===sources[2].quote,'未选中工具原文')})
  await test('原有摘录跳转仍可选中原句',async()=>{window.dispatchEvent(new CustomEvent('dsh-provenance:jump-to-source',{detail:{quote:claim,seq:900,sessionId:'synthetic'}}));await until(()=>getSelection().toString()===claim,'摘录未跳转')})
  await test('悬停原文只有追问和返回，追问携带引用并保留草稿与附件且不自动发送',async()=>{
   await wait(450)
@@ -476,7 +492,7 @@ async function runTests(){
  })
  await test('重新分析恢复后清除错误并保留全部依据',async()=>{
   traceFailure=null;analyzeAgain()
-  await until(()=>document.querySelectorAll('.dsp-ev').length===3,'重新分析未恢复')
+  await until(()=>document.querySelectorAll('.dsp-atom .dsp-ev').length===3,'重新分析未恢复')
   const text=document.querySelector('.dsp-body').textContent
   if(text.includes('已自动重试一次') || text.includes('分析失败'))throw Error('错误提示未清除')
  })
@@ -569,7 +585,7 @@ async function runTests(){
   byText('×')?.closest('.dsp-search-dock')?.querySelector('button[aria-label="清空搜索"]')?.click()
   await inputSearch('')
   await until(()=>!CSS.highlights.has('dsp-search')&&!CSS.highlights.has('dsp-search-current'),'搜索高亮残留')
-  if(document.querySelectorAll('.dsp-ev').length!==3)throw Error('原溯源结果未恢复')
+  if(document.querySelectorAll('.dsp-atom .dsp-ev').length!==3)throw Error('原溯源结果未恢复')
  })
  await test('中文输入法组合期间不发搜索请求',async()=>{
   const before=window.fixtureSearchRequests.length
@@ -591,7 +607,7 @@ async function runTests(){
  await test('搜索结果可直接溯源，并采用匹配消息身份而非旧选区',async()=>{
   const before=window.fixtureTraceCalls
   document.querySelector('.dsp-search-result .dsp-btn').click()
-  await until(()=>document.querySelectorAll('.dsp-ev').length===3,'没有进入分析结果')
+  await until(()=>document.querySelectorAll('.dsp-atom .dsp-ev').length===3,'没有进入分析结果')
   if(searchInput().value||CSS.highlights.has('dsp-search-current'))throw Error('未退出词句搜索')
   if(window.fixtureTraceCalls!==before+1||window.fixtureLastTrace.seq!==3||window.fixtureLastTrace.role!=='assistant')throw Error('沿用了旧选区的消息身份')
   if(!window.fixtureLastTrace.quote.includes('紫杉协议'))throw Error('没有使用匹配处原文')
@@ -691,7 +707,7 @@ async function runTests(){
   scope().click();await until(()=>document.querySelectorAll('.dsp-related-item').length>=2,'没有跨会话卡片')
   await until(()=>document.querySelector('.dsp-body')?.textContent.includes('6 / 6'),'没有续查全部其他会话')
   if(window.fixtureRelationCalls!==before)throw Error('查找或切换自动调用了关系模型')
-  if(!document.querySelector('.dsp-body').textContent.includes('晚于本条，不能作为当时的依据'))throw Error('没有区分后续观点')
+  if(!document.querySelector('.dsp-body').textContent.includes('后续补充 · 不计入此前依据'))throw Error('没有区分后续观点')
   if(document.querySelector('.dsp-foot-grid')||document.querySelector('.dsp-search-dock'))throw Error('候选视图混入本对话操作')
  })
  await test('关系分析只在点击后调用，并保留候选原文及关系限制',async()=>{
@@ -702,7 +718,7 @@ async function runTests(){
   if(!document.querySelector('.dsp-body').textContent.includes('6,000 字节'))throw Error('没有说明片段预算')
   if(!document.querySelector('.dsp-related-explanation').textContent.includes('不能'))throw Error('未显示关系限制')
   scope().click();await wait(40)
-  if(document.querySelectorAll('.dsp-ev').length!==3)throw Error('返回本对话丢失原溯源结果')
+  if(document.querySelectorAll('.dsp-atom .dsp-ev').length!==3)throw Error('返回本对话丢失原溯源结果')
   scope().click();await wait(40)
   if(window.fixtureRelationCalls!==before+1)throw Error('反复切换自动分析')
   scope().click();await wait(40)
@@ -772,7 +788,7 @@ async function runTests(){
   await demoLongSelection()
   const preview=document.querySelector('.dsp-claim-preview');const expand=preview.querySelector('.dsp-claim-toggle')
   if(Math.abs(expand.getBoundingClientRect().right-preview.getBoundingClientRect().right)>2)throw Error('展开按钮未右对齐')
-  const actions=document.querySelector('.dsp-claim-actions');const save=actions.querySelector('button')
+  const actions=document.querySelector('.dsp-claim-actions');const save=[...actions.querySelectorAll('button')].find(button=>['存为笔记','已存笔记'].includes(button.textContent))
   if(Math.abs(save.getBoundingClientRect().right-actions.getBoundingClientRect().right)>2)throw Error('存笔记未右对齐')
   const bar=document.querySelector('.dsp-tabbar');const body=document.querySelector('.dsp-body')
   if(bar.parentElement!==document.querySelector('.dsp-card')||body.contains(bar))throw Error('标签栏仍在滚动正文内')
@@ -826,22 +842,23 @@ async function runTests(){
   getSelection().removeAllRanges();getSelection().addRange(range);input.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}))
   await until(()=>window.fixtureTraceCalls>calls&&document.querySelector('.dsp-cancel-analysis'),'缺少取消分析入口')
   const request=window.fixtureTraceRequests.at(-1)
-  const actions=document.querySelector('.dsp-claim-actions');const cancel=actions.querySelector('.dsp-cancel-analysis')
-  if(!cancel.classList.contains('danger')||Math.abs(cancel.getBoundingClientRect().right-actions.getBoundingClientRect().right)>2)throw Error('取消按钮未采用右侧危险操作样式')
+  const actions=document.querySelector('.dsp-progress');const cancel=actions.querySelector('.dsp-cancel-analysis')
+  if(!cancel.classList.contains('danger')||Math.abs(cancel.getBoundingClientRect().right-actions.getBoundingClientRect().right)>2)throw Error('取消按钮未与进度文字同排靠右')
+  if(document.querySelector('.dsp-claim-actions .dsp-cancel-analysis')||Math.abs(cancel.getBoundingClientRect().y+cancel.getBoundingClientRect().height/2-actions.querySelector('.dsp-progress-message').getBoundingClientRect().y-actions.querySelector('.dsp-progress-message').getBoundingClientRect().height/2)>2)throw Error('取消按钮仍单独占行或未对齐')
   cancel.click();await wait(60)
   if(!request.aborted||document.querySelector('.dsp-spin')||document.querySelector('.dsp-cancel-analysis'))throw Error('取消未中断请求或未停止加载')
   if(document.querySelector('.dsp-claim-text').textContent!==`「${claim}」`||!byText('存为笔记'))throw Error('取消后选文或存笔记丢失')
   traceBehavior='normal';await selectClaim()
   await until(()=>request.completed,'旧响应没有返回');await wait(50)
-  if(document.querySelector('.dsp-body').textContent.includes('迟到的旧分析')||document.querySelectorAll('.dsp-ev').length!==3)throw Error('旧分析覆盖了新结果')
+  if(document.querySelector('.dsp-body').textContent.includes('迟到的旧分析')||document.querySelectorAll('.dsp-atom .dsp-ev').length!==3)throw Error('旧分析覆盖了新结果')
  })
  await test('补充网页检索也可取消，迟到材料不显示且可再次发起检索',async()=>{
-  byText('补充检索网页').click();await until(()=>document.querySelector('.dsp-cancel-analysis'),'补查缺少取消按钮')
+  byText('联网查资料').click();await until(()=>document.querySelector('.dsp-cancel-analysis'),'补查缺少取消按钮')
   const request=window.fixtureWebRequests.at(-1)
   document.querySelector('.dsp-cancel-analysis').click();await wait(50)
-  if(!request.aborted||!byText('补充检索网页')||byText('补充检索网页').disabled)throw Error('补查未中断或没有恢复入口')
+  if(!request.aborted||!byText('联网查资料')||byText('联网查资料').disabled)throw Error('补查未中断或没有恢复入口')
   await until(()=>request.completed,'迟到补查没有结束');await wait(40)
-  if(document.querySelector('.dsp-body').textContent.includes('迟到的网页材料')||document.querySelectorAll('.dsp-ev').length!==3)throw Error('取消补查影响原结果或显示迟到材料')
+  if(document.querySelector('.dsp-body').textContent.includes('迟到的网页材料')||document.querySelectorAll('.dsp-atom .dsp-ev').length!==3)throw Error('取消补查影响原结果或显示迟到材料')
  })
  await test('关系分析可取消且保留候选，迟到分析不显示并支持重新分析',async()=>{
   await selectClaim();await until(()=>!scope().disabled,'没有关联候选');scope().click();await wait(50)
@@ -909,9 +926,9 @@ async function runTests(){
   if(rects.some(rect=>Math.abs(rect.top-rects[0].top)>1)||!(rects[0].right<=rects[1].left&&rects[1].right<=rects[2].left))throw Error('三项工具没有从左到右同排')
   const hover=async(id,previous)=>{if(previous)tool(previous).dispatchEvent(new MouseEvent('mouseout',{bubbles:true,relatedTarget:tool(id)}));else tool(id).dispatchEvent(new MouseEvent('mouseover',{bubbles:true,relatedTarget:document.body}));await wait(30)}
   await hover('filter')
-  if(document.querySelectorAll('.dsp-filters button').length!==4)throw Error('悬停没有展开来源筛选')
+  if(document.querySelectorAll('.dsp-filters button').length!==5)throw Error('悬停没有展开来源筛选')
   ;[...document.querySelectorAll('.dsp-filters button')].find(button=>button.textContent==='你的原话').click();await wait(30)
-  if(document.querySelectorAll('.dsp-ev').length!==1||!document.querySelector('.dsp-ev').textContent.includes('你的原话'))throw Error('筛选没有限制依据来源')
+  if(document.querySelectorAll('.dsp-atom .dsp-ev').length!==1||!document.querySelector('.dsp-ev').textContent.includes('你的原话'))throw Error('筛选没有限制依据来源')
   ;[...document.querySelectorAll('.dsp-filters button')].find(button=>button.textContent==='全部').click();await wait(30)
   await hover('chain','filter')
   if(document.querySelectorAll('.dsp-node').length!==4||document.querySelector('.dsp-filters'))throw Error('思路链未独立显示')
@@ -965,3 +982,159 @@ async function runTests(){
  document.querySelector('#test-summary').textContent=`${window.fixtureResults.filter(x=>x.ok).length}/${window.fixtureResults.length} 通过`
 }
 createRoot(document.querySelector('#root')).render(h(App))
+
+async function runInteractionTests(){
+ const checks=[]
+ const record=(name,ok,detail='')=>{checks.push({name,ok,detail});document.querySelector('#test-results').textContent=JSON.stringify(checks,null,2)}
+ const test=async(name,fn)=>{try{await fn();record(name,true)}catch(error){record(name,false,String(error))}}
+ const byText=text=>[...document.querySelectorAll('button')].find(el=>el.textContent===text)
+ const selectRaw=()=>{const el=document.querySelector('#claim'),r=document.createRange();r.selectNodeContents(el);getSelection().removeAllRanges();getSelection().addRange(r);el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}))}
+ const close=async()=>{if(document.querySelector('.dsp-card')){document.querySelector('.dsp-card [aria-label="关闭"]').click();await until(()=>!document.querySelector('.dsp-card'),'关闭未完成')}getSelection().removeAllRanges()}
+ const check=text=>[...document.querySelectorAll('.dsp-material-options label')].find(el=>el.textContent===text).querySelector('input')
+ if(!document.querySelector('.dsp-card')){document.querySelector('.dsp-trigger').click();await until(()=>document.querySelector('.dsp-card'),'初始化模式失败')}
+ document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click();await until(()=>document.querySelector('.dsp-settings'),'初始化设置失败')
+ for(const label of ['窗口边缘吸附','拖选后自动分析']){const input=[...document.querySelectorAll('.dsp-settings-check')].find(el=>el.textContent.includes(label)).querySelector('input');if(input.checked!==(label==='窗口边缘吸附'))input.click()}
+ await wait(40);byText('恢复窗口位置 / Reset position').click();document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click()
+ await close()
+ await test('未开模式拖选只出现小入口，不调用模型；点击后启动溯源',async()=>{
+  const before=window.fixtureTraceCalls;selectRaw();await until(()=>document.querySelector('.dsp-quick-trace'),'缺少选词入口')
+  if(window.fixtureTraceCalls!==before)throw Error('拖选即调用模型')
+  byText('溯源这段').click();await until(()=>window.fixtureTraceCalls===before+1&&document.querySelectorAll('.dsp-atom .dsp-ev').length===3,'未启动溯源')
+ })
+ await test('检索未配置有明确提示，失败按钮可直接重试且保留归因',async()=>{
+  webBehavior='unconfigured';const before=window.fixtureTraceCalls;byText('联网查资料').click()
+  await until(()=>document.querySelector('.dsp-extra')?.textContent.includes('尚未配置'),'缺少配置说明')
+  if(!byText('重试网页检索')||byText('重试网页检索').disabled)throw Error('失败后仍禁用')
+  webBehavior='empty';byText('重试网页检索').click();await until(()=>document.querySelector('.dsp-extra')?.textContent.includes('未找到可直接支撑'),'空结果不明确')
+  if(window.fixtureTraceCalls!==before||byText('再次检索网页').disabled)throw Error('重试影响了归因或入口')
+  if(document.querySelector('.dsp-extra').textContent.includes('当时未使用'))throw Error('仍有误导文案')
+ })
+ await test('解释词句独立于网页检索，明确解释未核验',async()=>{
+  webBehavior='normal';byText('解释词句').click();await until(()=>document.querySelector('.dsp-explanation'),'解释未显示')
+  if(window.fixtureWebRequests.at(-1).body.intent!=='explain'||!document.querySelector('.dsp-extra .dsp-extra-title').textContent.includes('未作事实核验'))throw Error('解释与核验混淆')
+ })
+ await test('标题拖动吸附并保存位置，不影响设置按钮',async()=>{
+  const head=document.querySelector('.dsp-head'),box=document.querySelector('.dsp-card').getBoundingClientRect(),x=box.x+70,y=box.y+20
+  head.dispatchEvent(new PointerEvent('pointerdown',{button:0,clientX:x,clientY:y,bubbles:true}))
+  window.dispatchEvent(new PointerEvent('pointermove',{clientX:70+12,clientY:100,bubbles:true}));await wait(50)
+  window.dispatchEvent(new PointerEvent('pointerup',{bubbles:true}));await wait(50)
+  const moved=document.querySelector('.dsp-card').getBoundingClientRect()
+  if(Math.abs(moved.left-8)>2||!localStorage.getItem('dsh-provenance:position:v1'))throw Error('未吸附并保存')
+  document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click();await until(()=>document.querySelector('.dsp-settings'),'设置按钮不能点击')
+ })
+ await test('设置可关闭吸附，恢复窗口位置',async()=>{
+  const wrap=[...document.querySelectorAll('.dsp-settings-check')].find(el=>el.textContent.includes('窗口边缘吸附'));wrap.querySelector('input').click();await wait(30)
+  if(JSON.parse(localStorage.getItem('dsh-provenance:interaction:v1')).snap!==false)throw Error('吸附设置未保存')
+  byText('恢复窗口位置 / Reset position').click();await wait(30)
+  if(localStorage.getItem('dsh-provenance:position:v1'))throw Error('位置未重置')
+  wrap.querySelector('input').click();await wait(30);document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click();await wait(30)
+ })
+ await test('任务材料读取冻结快照并标记未读取文件；默认不调用关系模型',async()=>{
+  check('包含任务材料').click();await until(()=>document.querySelector('.dsp-materials')?.textContent.includes('任务内冻结资料'),'任务快照未出现')
+  const el=document.querySelector('.dsp-materials');if(!el.textContent.includes('截至 #4')||!el.textContent.includes('research/notes.md')||window.fixtureMaterialRequests.at(-1).analyze)throw Error('快照身份/读取范围不正确')
+  if(document.querySelectorAll('.dsp-material-options input').length!==1)throw Error('仍有后续补充勾选项')
+ })
+ await test('后续内容单独展示并能打开原文，未倒置成历史依据',async()=>{
+  await until(()=>document.querySelector('.dsp-materials')?.textContent.includes('后续补充：'),'未发现后续材料')
+  if(!document.querySelector('.dsp-later .dsp-rel-later')||!document.querySelector('.dsp-materials').textContent.includes('晚于选句'))throw Error('后续材料没有时间边界')
+  const earlier=document.querySelector('.dsp-atom'),later=document.querySelector('.dsp-later');if(!(earlier.compareDocumentPosition(later)&Node.DOCUMENT_POSITION_FOLLOWING))throw Error('后续未排在此前依据后面')
+  document.querySelector('[data-dsp-tool=filter]').click();await until(()=>document.querySelector('[data-filter=later]'),'缺少后续筛选');document.querySelector('[data-filter=later]').click();await wait(30)
+  if(document.querySelector('.dsp-atom')||!document.querySelector('.dsp-later'))throw Error('后续筛选混入此前依据')
+  document.querySelector('[data-filter=all]').click();await wait(30)
+  const card=[...document.querySelectorAll('.dsp-materials article')].find(el=>el.textContent.includes('后续补充：'));card.querySelector('button').click();await until(()=>window.fixtureLoads.includes(920)&&getSelection().toString().includes('后续补充：'),'后续原文跳转未完成')
+ })
+ await test('同一选句重新分析会重新读取后续消息，不沿用旧起点',async()=>{
+  const previous=window.fixtureMaterialRequests.length;byText('重新分析').click()
+  await until(()=>window.fixtureMaterialRequests.length>previous&&document.querySelector('.dsp-later'),'重新分析未更新后续内容')
+  if(window.fixtureMaterialRequests.at(-1).includeLater!==true)throw Error('默认后续检索未传递')
+ })
+ await test('关系分析按需调用并保留材料来源',async()=>{
+  byText('分析材料关系').click();await until(()=>document.querySelector('.dsp-materials')?.textContent.includes('这是后续讨论中的补充'),'关系说明未出现')
+  if(!window.fixtureMaterialRequests.at(-1).analyze)throw Error('未发显式分析')
+ })
+ await test('自动分析可选，关闭模式后拖选也可直接启动',async()=>{
+  document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click()
+  await until(()=>document.querySelector('.dsp-settings'),'设置未打开');const auto=[...document.querySelectorAll('.dsp-settings-check')].find(el=>el.textContent.includes('拖选后自动分析')).querySelector('input');auto.click();await wait(50)
+  await close();const before=window.fixtureTraceCalls;selectRaw();await until(()=>window.fixtureTraceCalls>before&&document.querySelectorAll('.dsp-atom .dsp-ev').length>=3,'自动分析未触发')
+  document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click();await until(()=>document.querySelector('.dsp-settings'),'重开设置未出现');[...document.querySelectorAll('.dsp-settings-check')].find(el=>el.textContent.includes('拖选后自动分析')).querySelector('input').click()
+  document.querySelector('.dsp-card [aria-label="设置 / Settings"]').click()
+ })
+ await test('缺少检索凭据时可打开内置配置页，不提交凭据或重新分析',async()=>{
+  webBehavior='unconfigured';byText('联网查资料')?.click();if(!byText('联网查资料'))byText('再次检索网页')?.click()
+  await until(()=>byText('配置网页检索'),'缺少配置入口');const before=window.fixtureTraceCalls
+  byText('配置网页检索').click();await until(()=>document.querySelector('[data-fixture-config]'),'未打开配置页')
+  if(window.fixtureConfigNavigations!==1||window.fixtureTraceCalls!==before)throw Error('配置导航造成额外归因调用')
+ })
+ await test('运行时无异常',async()=>{if(window.fixtureErrors.length)throw Error(window.fixtureErrors.join(' | '))})
+ window.fixtureInteractionResults=checks
+}
+
+async function demoReview(kind){
+ await until(()=>document.querySelector('.dsp-trigger'),'插件尚未加载完成')
+ const byText=text=>[...document.querySelectorAll('button')].find(el=>el.textContent===text)
+ if(kind==='selection'){
+  if(document.querySelector('.dsp-card')){document.querySelector('.dsp-card [aria-label="关闭"]').click();await until(()=>!document.querySelector('.dsp-card'),'关闭中')}
+  const el=document.querySelector('#claim');el.scrollIntoView({block:'center'});const range=document.createRange();range.selectNodeContents(el);getSelection().removeAllRanges();getSelection().addRange(range);el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));return
+ }
+ if(!document.querySelector('.dsp-card')){document.querySelector('.dsp-trigger').click();await until(()=>document.querySelector('.dsp-card'),'未打开')}
+ for(const input of document.querySelectorAll('.dsp-material-options input'))if(input.checked)input.click()
+ await wait(60);await selectClaim()
+ if(kind==='progress'){traceBehavior='hold';byText('重新分析').click();return}
+ if(kind==='web'){
+  webBehavior='unconfigured';byText('联网查资料').click();await until(()=>document.querySelector('.dsp-extra')?.textContent.includes('尚未配置'),'未显示错误');webBehavior='normal'
+  document.querySelector('.dsp-extra').scrollIntoView({block:'center'})
+ }else{
+  for(const input of document.querySelectorAll('.dsp-material-options input'))if(!input.checked)input.click()
+  await until(()=>document.querySelector('.dsp-materials')?.textContent.includes('任务内冻结资料'),'材料未加载')
+  document.querySelector('.dsp-body').scrollTop=0
+ }
+}
+
+async function runResizeTests(){
+ const checks=[],record=(name,ok,detail='')=>{checks.push({name,ok,detail});document.querySelector('#test-results').textContent=JSON.stringify(checks,null,2)}
+ const test=async(name,fn)=>{try{await fn();record(name,true)}catch(error){record(name,false,String(error))}}
+ const box=()=>document.querySelector('.dsp-card').getBoundingClientRect()
+ const drag=async(edge,dx,dy,cancel=false)=>{
+  const el=document.querySelector(`.dsp-resize[data-edge="${edge}"]`),r=el.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2
+  el.dispatchEvent(new PointerEvent('pointerdown',{button:0,pointerId:1,clientX:x,clientY:y,bubbles:true}))
+  window.dispatchEvent(new PointerEvent('pointermove',{pointerId:1,clientX:x+dx,clientY:y+dy,bubbles:true}));await wait(35)
+  window.dispatchEvent(new PointerEvent(cancel?'pointercancel':'pointerup',{pointerId:1,clientX:x+dx,clientY:y+dy,bubbles:true}));await wait(60)
+ }
+ const baseline=async()=>{
+  let r=box();await drag('se',420-r.width,400-r.height);r=box()
+  document.querySelector('.dsp-head').dispatchEvent(new PointerEvent('pointerdown',{button:0,clientX:r.x+70,clientY:r.y+20,bubbles:true}))
+  window.dispatchEvent(new PointerEvent('pointermove',{clientX:270,clientY:120,bubbles:true}));await wait(30)
+  window.dispatchEvent(new PointerEvent('pointerup'));await wait(40)
+ }
+ if(!document.querySelector('.dsp-card')){document.querySelector('.dsp-trigger').click();await until(()=>document.querySelector('.dsp-card'),'窗口未打开')}
+ await selectClaim()
+ await test('四边四角都有独立缩放入口，按钮仍可点击',async()=>{
+  if(document.querySelectorAll('.dsp-resize').length!==8)throw Error('缩放入口不是八个')
+  document.querySelector('.dsp-gear').click();await until(()=>document.querySelector('.dsp-settings'),'边角遮挡设置按钮');document.querySelector('.dsp-gear').click()
+ })
+ for(const edge of ['n','ne','e','se','s','sw','w','nw'])await test(`${edge} 缩放保持对边不动`,async()=>{
+  await baseline();const before=box(),dx=edge.includes('w')?18:edge.includes('e')?-18:0,dy=edge.includes('n')?18:edge.includes('s')?-18:0
+  await drag(edge,dx,dy);const after=box()
+  if(Math.abs(after.width-(before.width-(dx?18:0)))>1||Math.abs(after.height-(before.height-(dy?18:0)))>1)throw Error('尺寸变化错误')
+  if(Math.abs((edge.includes('w')?after.right:after.left)-(edge.includes('w')?before.right:before.left))>1)throw Error('左右对边漂移')
+  if(Math.abs((edge.includes('n')?after.bottom:after.top)-(edge.includes('n')?before.bottom:before.top))>1)throw Error('上下对边漂移')
+ })
+ await test('最小尺寸和屏幕边界限制，不会反向翻转',async()=>{
+  await baseline();await drag('nw',9999,9999);let r=box();if(Math.abs(r.width-320)>1||Math.abs(r.height-240)>1)throw Error('最小尺寸失效')
+  await drag('nw',-9999,-9999);r=box();if(r.left<7||r.top<7)throw Error('窗口移出屏幕')
+  await drag('se',9999,9999);r=box();if(r.right>innerWidth-7||r.bottom>innerHeight-7)throw Error('窗口越过屏幕')
+ })
+ await test('指针取消后停止缩放，关闭重开保留大小与位置',async()=>{
+  await baseline();await drag('e',-18,0,true);let r=box();const saved=JSON.parse(localStorage.getItem('dsh-provenance:size:v1'))
+  if(Math.abs(saved.w-r.width)>1||document.querySelector('.dsp-card').dataset.resizing!=='false')throw Error('未保存或未停止')
+  window.dispatchEvent(new PointerEvent('pointermove',{pointerId:1,clientX:900,clientY:800}));await wait(30);if(box().width!==r.width)throw Error('取消后仍在缩放')
+  document.querySelector('.dsp-close').click();await until(()=>!document.querySelector('.dsp-card'),'关闭未完成');document.querySelector('.dsp-trigger').click();await until(()=>document.querySelector('.dsp-card'),'重开失败');await wait(280)
+  if(Math.abs(box().width-r.width)>1||Math.abs(box().left-r.left)>1)throw Error('重开后丢失尺寸或位置')
+ })
+ await test('键盘可微调尺寸，双击恢复默认宽度',async()=>{
+  await baseline();const before=box(),handle=document.querySelector('.dsp-resize[data-edge="w"]');handle.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));await wait(40)
+  if(Math.abs(box().width-before.width+16)>1||Math.abs(box().right-before.right)>1)throw Error('键盘调整失效')
+  handle.dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));await wait(50);if(box().width!==420)throw Error('双击未复位')
+ })
+ await test('运行时无异常',async()=>{if(window.fixtureErrors.length)throw Error(window.fixtureErrors.join(' | '))})
+}

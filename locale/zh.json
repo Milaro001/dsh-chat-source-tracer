@@ -8,7 +8,7 @@
     "hint": "拖选聊天里的一句话 · Esc 取消",
     "loading": "正在回看前面的对话…",
     "empty": "先框选一句话。",
-    "unsupported": "未找到依据——这句可能是模型自行补充的。",
+    "unsupported": "未找到依据：当前检索范围内没有可核对的较早原文。",
     "close": "关闭",
     "retry": "重新分析",
     "evidenceCount": "{n} 条依据",
